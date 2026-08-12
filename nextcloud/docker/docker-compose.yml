@@ -34,7 +34,7 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change-me}
       NEXTCLOUD_ADMIN_USER: admin
       NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:-change-me}
-      NEXTCLOUD_TRUSTED_DOMAINS: "10.0.77.101 nextcloud.corp cloud.nuvem.laupertec.com.br"
+      NEXTCLOUD_TRUSTED_DOMAINS: "10.0.77.101 nextcloud.corp cloud.applaupertec.com"
 
 volumes:
   db_data:
