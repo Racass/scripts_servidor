@@ -1,1 +1,3 @@
 nextcloud/docker/.env
+auditoria/auditoria-*/
+auditoria/*.tar.gz
