@@ -1,0 +1,462 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+umask 027
+export LC_ALL=C
+
+readonly EXIT_CONFIG=10
+readonly EXIT_DEPENDENCY=11
+readonly EXIT_PRIVILEGE=12
+readonly EXIT_LOCKED=20
+readonly EXIT_SOURCE=30
+readonly EXIT_UNSTABLE=31
+readonly EXIT_IDENTITY_DIVERGENCE=32
+readonly EXIT_USERNAME=33
+readonly EXIT_INVALID_STATE=40
+readonly EXIT_FILESYSTEM=70
+
+readonly -a MANAGED_GROUPS=(
+    "samba-users"
+    "samba-admin"
+    "samba-laudos"
+    "samba-laudos-mega"
+    "samba-administrativo"
+)
+readonly EXCLUDED_USER="nextcloud_user"
+readonly STATE_DIR="/var/lib/samba-nextcloud-export"
+readonly VALIDATOR_PATH="/usr/local/lib/samba-nextcloud/validate-nextcloud-state.jq"
+readonly LOCK_DIR="/run/samba-nextcloud-export"
+readonly LOCK_FILE="$LOCK_DIR/export.lock"
+readonly MAX_STATE_BYTES=1048576
+
+CONFIG_FILE="/etc/samba-nextcloud-export.conf"
+STATE_GROUP="nextcloud-sync"
+SOURCE_HOST="fileserver.corp"
+MAX_STABILITY_ATTEMPTS=5
+STABILITY_DELAY_SECONDS=2
+RETENTION_DAYS=7
+
+WORK_DIR=""
+STATE_TEMP=""
+ARCHIVE_TEMP=""
+
+log() {
+    local level="$1"
+    shift
+    printf '[%s] %s\n' "$level" "$*" >&2
+}
+
+die() {
+    local code="$1"
+    shift
+    log "ERROR" "$*"
+    exit "$code"
+}
+
+cleanup() {
+    if [[ -n "$STATE_TEMP" && -e "$STATE_TEMP" ]]; then
+        rm -f -- "$STATE_TEMP"
+    fi
+    if [[ -n "$ARCHIVE_TEMP" && -e "$ARCHIVE_TEMP" ]]; then
+        rm -f -- "$ARCHIVE_TEMP"
+    fi
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+        rm -rf -- "$WORK_DIR"
+    fi
+}
+
+trap cleanup EXIT
+
+usage() {
+    cat >&2 <<'EOF'
+Uso: export-nextcloud-state [--config /caminho/arquivo.conf]
+EOF
+}
+
+parse_arguments() {
+    if [[ $# -eq 0 ]]; then
+        return
+    fi
+    if [[ $# -eq 2 && "$1" == "--config" ]]; then
+        CONFIG_FILE="$2"
+        return
+    fi
+    usage
+    exit "$EXIT_CONFIG"
+}
+
+validate_root_owned_file() {
+    local path="$1"
+    local owner mode
+
+    [[ -f "$path" && ! -L "$path" ]] ||
+        die "$EXIT_CONFIG" "Arquivo de configuracao invalido: $path"
+
+    owner="$(stat -c '%u' -- "$path")"
+    mode="$(stat -c '%a' -- "$path")"
+    [[ "$owner" == "0" ]] ||
+        die "$EXIT_CONFIG" "A configuracao deve pertencer a root: $path"
+    (( (8#$mode & 8#022) == 0 )) ||
+        die "$EXIT_CONFIG" "A configuracao nao pode ser gravavel por grupo/outros: $path"
+}
+
+load_configuration() {
+    [[ "$CONFIG_FILE" == /* ]] ||
+        die "$EXIT_CONFIG" "O caminho da configuracao deve ser absoluto"
+
+    if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
+        validate_root_owned_file "$CONFIG_FILE"
+        # A configuracao e confiavel somente apos validar owner e permissoes.
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    [[ "$STATE_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] ||
+        die "$EXIT_CONFIG" "STATE_GROUP invalido"
+    [[ "$SOURCE_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] ||
+        die "$EXIT_CONFIG" "SOURCE_HOST invalido"
+    [[ "$MAX_STABILITY_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] ||
+        die "$EXIT_CONFIG" "MAX_STABILITY_ATTEMPTS invalido"
+    [[ "$STABILITY_DELAY_SECONDS" =~ ^[0-9]+$ ]] ||
+        die "$EXIT_CONFIG" "STABILITY_DELAY_SECONDS invalido"
+    [[ "$RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]] ||
+        die "$EXIT_CONFIG" "RETENTION_DAYS invalido"
+}
+
+require_dependencies() {
+    local command
+    for command in \
+        cat cmp cut date find flock getent grep id install jq mkdir mktemp mv \
+        pdbedit rm sleep sort stat sync testparm tr
+    do
+        command -v "$command" >/dev/null 2>&1 ||
+            die "$EXIT_DEPENDENCY" "Dependencia ausente: $command"
+    done
+
+    [[ -r /proc/sys/kernel/random/uuid ]] ||
+        die "$EXIT_DEPENDENCY" "Fonte de UUID indisponivel"
+    [[ -f "$VALIDATOR_PATH" && ! -L "$VALIDATOR_PATH" ]] ||
+        die "$EXIT_CONFIG" "Validador ausente ou inseguro: $VALIDATOR_PATH"
+}
+
+validate_runtime_paths() {
+    local owner mode
+
+    if [[ -L "$STATE_DIR" ]]; then
+        die "$EXIT_FILESYSTEM" "STATE_DIR nao pode ser symlink"
+    fi
+    if [[ ! -e "$STATE_DIR" ]]; then
+        install -d -o root -g root -m 0755 -- "$STATE_DIR" ||
+            die "$EXIT_FILESYSTEM" "Nao foi possivel preparar $STATE_DIR"
+    fi
+    [[ -d "$STATE_DIR" ]] ||
+        die "$EXIT_FILESYSTEM" "STATE_DIR nao e um diretorio"
+
+    owner="$(stat -c '%u' -- "$STATE_DIR")"
+    mode="$(stat -c '%a' -- "$STATE_DIR")"
+    [[ "$owner" == "0" ]] ||
+        die "$EXIT_FILESYSTEM" "STATE_DIR deve pertencer a root"
+    (( (8#$mode & 8#022) == 0 )) ||
+        die "$EXIT_FILESYSTEM" "STATE_DIR nao pode ser gravavel por grupo/outros"
+
+    if [[ -L "$LOCK_DIR" ]]; then
+        die "$EXIT_FILESYSTEM" "LOCK_DIR nao pode ser symlink"
+    fi
+    if [[ ! -e "$LOCK_DIR" ]]; then
+        install -d -o root -g root -m 0700 -- "$LOCK_DIR" ||
+            die "$EXIT_FILESYSTEM" "Nao foi possivel preparar LOCK_DIR"
+    fi
+    [[ "$(stat -c '%F:%u:%g:%a' -- "$LOCK_DIR")" == \
+        "directory:0:0:700" ]] ||
+        die "$EXIT_FILESYSTEM" "LOCK_DIR deve ser diretorio root:root 0700"
+    [[ ! -e "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] ||
+        [[ "$(stat -c '%F:%u:%g' -- "$LOCK_FILE")" == \
+            "regular empty file:0:0" ]] ||
+        die "$EXIT_FILESYSTEM" "Lock file existente e inseguro"
+}
+
+validate_samba_role() {
+    local role
+    role="$(testparm -s --parameter-name='server role' 2>/dev/null)" ||
+        die "$EXIT_SOURCE" "Nao foi possivel consultar o papel do Samba"
+    [[ "$role" == "standalone server" ]] ||
+        die "$EXIT_SOURCE" "Papel Samba inesperado: $role"
+}
+
+valid_username() {
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
+capture_group_state() {
+    local destination="$1"
+    local group record found_group ignored gid members extra username
+    local samba_user passwd_record primary_gid
+    local -a member_list=()
+    local -A gid_to_group=()
+
+    mkdir -p -- "$destination/groups"
+    : >"$destination/normalized"
+    : >"$destination/excluded-users"
+
+    for group in "${MANAGED_GROUPS[@]}"; do
+        record="$(getent group "$group")" ||
+            die "$EXIT_SOURCE" "Grupo obrigatorio nao encontrado: $group"
+        [[ "$record" != *$'\n'* ]] ||
+            die "$EXIT_SOURCE" "NSS retornou mais de um registro para $group"
+
+        IFS=':' read -r found_group ignored gid members extra <<<"$record"
+        [[ "$found_group" == "$group" && "$gid" =~ ^[0-9]+$ && -z "$extra" ]] ||
+            die "$EXIT_SOURCE" "Registro NSS invalido para $group"
+        [[ -z "${gid_to_group[$gid]:-}" ]] ||
+            die "$EXIT_SOURCE" "Grupos gerenciados compartilham o GID $gid"
+        gid_to_group["$gid"]="$group"
+
+        : >"$destination/groups/$group"
+        if [[ -n "$members" ]]; then
+            IFS=',' read -r -a member_list <<<"$members"
+            for username in "${member_list[@]}"; do
+                if [[ "$username" == "$EXCLUDED_USER" ]]; then
+                    printf '%s\n' "$username" >>"$destination/excluded-users"
+                    continue
+                fi
+                valid_username "$username" ||
+                    die "$EXIT_USERNAME" "Username invalido em $group: $username"
+                printf '%s\n' "$username" >>"$destination/groups/$group"
+            done
+        fi
+
+    done
+
+    pdbedit -L | cut -d: -f1 | sort -u >"$destination/tdbsam-users" ||
+        die "$EXIT_SOURCE" "Nao foi possivel ler o tdbsam"
+
+    while IFS= read -r samba_user; do
+        [[ -n "$samba_user" ]] || continue
+        passwd_record="$(getent passwd "$samba_user" || true)"
+        [[ -n "$passwd_record" && "$passwd_record" != *$'\n'* ]] || continue
+        IFS=':' read -r username ignored ignored primary_gid ignored \
+            <<<"$passwd_record"
+        group="${gid_to_group[$primary_gid]:-}"
+        [[ -n "$group" ]] || continue
+        if [[ "$username" == "$EXCLUDED_USER" ]]; then
+            printf '%s\n' "$username" >>"$destination/excluded-users"
+            continue
+        fi
+        valid_username "$username" ||
+            die "$EXIT_USERNAME" \
+                "Username primario invalido em $group: $username"
+        printf '%s\n' "$username" >>"$destination/groups/$group"
+    done <"$destination/tdbsam-users"
+
+    for group in "${MANAGED_GROUPS[@]}"; do
+        sort -u -o "$destination/groups/$group" "$destination/groups/$group"
+        printf '@%s\n' "$group" >>"$destination/normalized"
+        cat "$destination/groups/$group" >>"$destination/normalized"
+    done
+
+    sort -u -o "$destination/excluded-users" "$destination/excluded-users"
+}
+
+read_stable_state() {
+    local attempt first second
+
+    for ((attempt = 1; attempt <= MAX_STABILITY_ATTEMPTS; attempt++)); do
+        first="$WORK_DIR/read-${attempt}-a"
+        second="$WORK_DIR/read-${attempt}-b"
+        capture_group_state "$first"
+        sleep "$STABILITY_DELAY_SECONDS"
+        capture_group_state "$second"
+
+        if cmp -s -- "$first/normalized" "$second/normalized"; then
+            STABLE_STATE_DIR="$second"
+            log "INFO" "Estado estavel obtido na tentativa $attempt"
+            return
+        fi
+
+        log "WARN" "Memberships mudaram durante a leitura; repetindo"
+    done
+
+    die "$EXIT_UNSTABLE" \
+        "Nao foi possivel obter duas leituras estaveis dos grupos"
+}
+
+validate_identities() {
+    local tdb_users="$WORK_DIR/tdbsam-users"
+    local all_users="$WORK_DIR/all-users"
+    local group username
+
+    pdbedit -L | cut -d: -f1 | sort -u >"$tdb_users" ||
+        die "$EXIT_SOURCE" "Nao foi possivel ler o tdbsam"
+
+    : >"$all_users"
+    for group in "${MANAGED_GROUPS[@]}"; do
+        cat "$STABLE_STATE_DIR/groups/$group" >>"$all_users"
+    done
+    sort -u -o "$all_users" "$all_users"
+
+    while IFS= read -r username; do
+        [[ -n "$username" ]] || continue
+        getent passwd "$username" >/dev/null ||
+            die "$EXIT_IDENTITY_DIVERGENCE" \
+                "Usuario presente nos grupos, mas ausente do NSS: $username"
+        grep -Fxq -- "$username" "$tdb_users" ||
+            die "$EXIT_IDENTITY_DIVERGENCE" \
+                "Usuario presente nos grupos, mas ausente do tdbsam: $username"
+    done <"$all_users"
+
+    ALL_USERS_FILE="$all_users"
+}
+
+build_json() {
+    local entries="$WORK_DIR/group-entries.jsonl"
+    local groups_json="$WORK_DIR/groups.json"
+    local users_json="$WORK_DIR/users.json"
+    local managed_json="$WORK_DIR/managed.json"
+    local output="$WORK_DIR/state.json"
+    local group generated_at generation_id
+
+    : >"$entries"
+    for group in "${MANAGED_GROUPS[@]}"; do
+        jq -Rn --arg key "$group" \
+            '{key: $key, value: [inputs]}' \
+            <"$STABLE_STATE_DIR/groups/$group" >>"$entries"
+    done
+
+    jq -s 'from_entries' "$entries" >"$groups_json"
+    jq -Rsc 'split("\n") | map(select(length > 0))' \
+        <"$ALL_USERS_FILE" >"$users_json"
+    printf '%s\n' "${MANAGED_GROUPS[@]}" |
+        jq -Rsc 'split("\n") | map(select(length > 0))' >"$managed_json"
+
+    generated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    generation_id="$(tr 'A-F' 'a-f' </proc/sys/kernel/random/uuid)"
+
+    jq -n \
+        --arg host "$SOURCE_HOST" \
+        --arg generated_at "$generated_at" \
+        --arg generation_id "$generation_id" \
+        --slurpfile managed "$managed_json" \
+        --slurpfile groups "$groups_json" \
+        --slurpfile users "$users_json" \
+        '{
+          schema_version: 1,
+          source: {
+            host: $host,
+            role: "ROLE_STANDALONE"
+          },
+          generation_id: $generation_id,
+          generated_at: $generated_at,
+          managed_groups: $managed[0],
+          groups: $groups[0],
+          users: $users[0],
+          counts: {
+            users: ($users[0] | length),
+            groups: ($managed[0] | length)
+          }
+        }' >"$output"
+
+    [[ "$(stat -c '%s' -- "$output")" -le "$MAX_STATE_BYTES" ]] ||
+        die "$EXIT_INVALID_STATE" \
+            "Snapshot excede o limite de $MAX_STATE_BYTES bytes"
+    jq -e -f "$VALIDATOR_PATH" "$output" >/dev/null ||
+        die "$EXIT_INVALID_STATE" "O snapshot gerado viola o contrato"
+
+    GENERATED_AT="$generated_at"
+    GENERATION_ID="$generation_id"
+    GENERATED_JSON="$output"
+}
+
+publish_state() {
+    local archive_dir="$STATE_DIR/archive"
+    local archive_name
+    local users_count
+
+    getent group "$STATE_GROUP" >/dev/null ||
+        die "$EXIT_CONFIG" "Grupo de leitura inexistente: $STATE_GROUP"
+
+    if [[ -L "$archive_dir" ]]; then
+        die "$EXIT_FILESYSTEM" "Diretorio de archive nao pode ser symlink"
+    fi
+    if [[ ! -e "$archive_dir" ]]; then
+        install -d -o root -g root -m 0700 -- "$archive_dir" ||
+            die "$EXIT_FILESYSTEM" "Nao foi possivel preparar o archive"
+    fi
+    [[ -d "$archive_dir" ]] ||
+        die "$EXIT_FILESYSTEM" "Archive nao e um diretorio"
+    [[ "$(stat -c '%u:%g:%a' -- "$archive_dir")" == "0:0:700" ]] ||
+        die "$EXIT_FILESYSTEM" "Archive deve ser root:root e modo 0700"
+
+    STATE_TEMP="$(mktemp --tmpdir="$STATE_DIR" '.state.json.tmp.XXXXXX')" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel criar arquivo temporario"
+    install -o root -g "$STATE_GROUP" -m 0640 \
+        "$GENERATED_JSON" "$STATE_TEMP" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel preparar o snapshot final"
+
+    jq -e -f "$VALIDATOR_PATH" "$STATE_TEMP" >/dev/null ||
+        die "$EXIT_INVALID_STATE" "Validacao final do snapshot falhou"
+    [[ "$(stat -c '%s' -- "$STATE_TEMP")" -le "$MAX_STATE_BYTES" ]] ||
+        die "$EXIT_INVALID_STATE" "Snapshot final excede 1 MiB"
+    sync -f "$STATE_TEMP" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel sincronizar o snapshot"
+
+    archive_name="state-${GENERATED_AT//[-:]/}-$GENERATION_ID.json"
+    ARCHIVE_TEMP="$(mktemp --tmpdir="$archive_dir" '.state.tmp.XXXXXX')" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel criar archive temporario"
+    install -o root -g root -m 0600 "$STATE_TEMP" "$ARCHIVE_TEMP" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel arquivar o snapshot"
+    jq -e -f "$VALIDATOR_PATH" "$ARCHIVE_TEMP" >/dev/null ||
+        die "$EXIT_INVALID_STATE" "Validacao do archive falhou"
+    sync -f "$ARCHIVE_TEMP" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel sincronizar o archive"
+    mv -fT -- "$ARCHIVE_TEMP" "$archive_dir/$archive_name" ||
+        die "$EXIT_FILESYSTEM" "Publicacao atomica do archive falhou"
+    ARCHIVE_TEMP=""
+    sync -f "$archive_dir" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel sincronizar o diretorio archive"
+
+    mv -fT -- "$STATE_TEMP" "$STATE_DIR/state.json" ||
+        die "$EXIT_FILESYSTEM" "Publicacao atomica falhou"
+    STATE_TEMP=""
+    sync -f "$STATE_DIR" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel sincronizar STATE_DIR"
+
+    find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
+        -name 'state-*.json' -mmin "+$((RETENTION_DAYS * 1440))" -delete
+
+    users_count="$(jq -r '.counts.users' "$STATE_DIR/state.json")"
+    log "INFO" \
+        "Snapshot publicado generation_id=$GENERATION_ID users=$users_count groups=5"
+}
+
+main() {
+    parse_arguments "$@"
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] ||
+        die "$EXIT_PRIVILEGE" "Execute como root"
+
+    load_configuration
+    require_dependencies
+    validate_runtime_paths
+
+    exec 9>"$LOCK_FILE"
+    flock -n 9 ||
+        die "$EXIT_LOCKED" "Outra exportacao esta em execucao"
+
+    WORK_DIR="$(mktemp -d -t samba-nextcloud-export.XXXXXX)" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel criar workspace"
+
+    validate_samba_role
+    read_stable_state
+
+    if [[ -s "$STABLE_STATE_DIR/excluded-users" ]]; then
+        log "WARN" \
+            "A conta tecnica $EXCLUDED_USER foi excluida do snapshot"
+    fi
+
+    validate_identities
+    build_json
+    publish_state
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

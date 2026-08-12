@@ -1,0 +1,13 @@
+[Unit]
+Description=Executa exportacao Samba para o Nextcloud a cada hora
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5min
+AccuracySec=1min
+Unit=export-nextcloud-state.service
+
+[Install]
+WantedBy=timers.target
+

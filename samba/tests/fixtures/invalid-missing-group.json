@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "source": {
+    "host": "fileserver.corp",
+    "role": "ROLE_STANDALONE"
+  },
+  "generation_id": "e6e66eb5-5f47-43e8-a9d4-41f5a1b5a2ac",
+  "generated_at": "2026-08-12T22:00:00Z",
+  "managed_groups": [
+    "samba-users",
+    "samba-admin",
+    "samba-laudos",
+    "samba-laudos-mega",
+    "samba-administrativo"
+  ],
+  "groups": {
+    "samba-users": ["ana"],
+    "samba-admin": [],
+    "samba-laudos": [],
+    "samba-laudos-mega": []
+  },
+  "users": ["ana"],
+  "counts": {
+    "users": 1,
+    "groups": 5
+  }
+}
+

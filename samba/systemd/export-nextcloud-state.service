@@ -1,0 +1,26 @@
+[Unit]
+Description=Exporta estado Samba para o Nextcloud
+Documentation=file:/usr/local/share/doc/samba-nextcloud/STATE-CONTRACT.md
+After=local-fs.target smbd.service
+Wants=smbd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/export-nextcloud-state
+UMask=0027
+PrivateTmp=true
+RuntimeDirectory=samba-nextcloud-export
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=samba-nextcloud-export
+StateDirectoryMode=0755
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+TimeoutStartSec=5min

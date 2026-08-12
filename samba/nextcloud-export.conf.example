@@ -1,0 +1,8 @@
+# Instale como /etc/samba-nextcloud-export.conf, root:root, modo 0640.
+
+STATE_GROUP="nextcloud-sync"
+SOURCE_HOST="fileserver.corp"
+
+MAX_STABILITY_ATTEMPTS=5
+STABILITY_DELAY_SECONDS=2
+RETENTION_DAYS=7
