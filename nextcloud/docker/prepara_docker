@@ -6,6 +6,7 @@ apt update
 apt install -y cifs-utils
 
 mkdir -p /etc/samba/creds
+SMB_PASSWORD="${NEXTCLOUD_SMB_PASSWORD:?Set NEXTCLOUD_SMB_PASSWORD to the Samba credential before running this script.}"
 tee /etc/samba/creds/nextcloud > /dev/null <<EOF
 username=nextcloud_user
 password=${NEXTCLOUD_SMB_PASSWORD:?Set NEXTCLOUD_SMB_PASSWORD to the Samba credential before running this script.}
