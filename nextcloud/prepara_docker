@@ -1,0 +1,35 @@
+#!/bin/bash
+# setup-cifs-mounts.sh — RODAR NA VM nextcloud.corp (10.0.77.101), como root
+set -e
+
+apt update
+apt install -y cifs-utils
+
+mkdir -p /etc/samba/creds
+tee /etc/samba/creds/nextcloud > /dev/null <<EOF
+username=nextcloud_user
+password=${NEXTCLOUD_SMB_PASSWORD:?Set NEXTCLOUD_SMB_PASSWORD to the Samba credential before running this script.}
+domain=WORKGROUP
+EOF
+chmod 600 /etc/samba/creds/nextcloud
+
+for SHARE in publico usuarios laudos laudos-mega administrativo; do
+    mkdir -p /mnt/nextcloud-data/$SHARE
+done
+
+declare -A SHARES=(
+    [publico]="Publico"
+    [usuarios]="Usuarios"
+    [laudos]="Laudos"
+    [laudos-mega]="Laudos-Mega"
+    [administrativo]="Administrativo"
+)
+
+for DIR in "${!SHARES[@]}"; do
+    SHARE_NAME="${SHARES[$DIR]}"
+    LINE="//10.0.77.100/$SHARE_NAME  /mnt/nextcloud-data/$DIR  cifs  credentials=/etc/samba/creds/nextcloud,uid=33,gid=33,file_mode=0770,dir_mode=0770,vers=3.0,_netdev  0  0"
+    grep -qF "/mnt/nextcloud-data/$DIR" /etc/fstab || echo "$LINE" >> /etc/fstab
+done
+
+mount -a
+mount | grep nextcloud-data

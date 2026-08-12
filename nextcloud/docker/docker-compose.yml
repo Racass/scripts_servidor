@@ -1,0 +1,42 @@
+services:
+  db:
+    image: mariadb:10.11
+    restart: unless-stopped
+    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
+    volumes:
+      - db_data:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-me}
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change-me}
+
+  app:
+    image: nextcloud:apache
+    container_name: nextcloud-app
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+    volumes:
+      - nc_html:/var/www/html
+      - nc_data:/var/www/html/data
+      - /mnt/nextcloud-data/publico:/mnt/samba/publico
+      - /mnt/nextcloud-data/usuarios:/mnt/samba/usuarios
+      - /mnt/nextcloud-data/laudos:/mnt/samba/laudos
+      - /mnt/nextcloud-data/laudos-mega:/mnt/samba/laudos-mega
+      - /mnt/nextcloud-data/administrativo:/mnt/samba/administrativo
+    environment:
+      MYSQL_HOST: db
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change-me}
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:-change-me}
+      NEXTCLOUD_TRUSTED_DOMAINS: "10.0.77.101 nextcloud.corp cloud.nuvem.laupertec.com.br"
+
+volumes:
+  db_data:
+  nc_html:
+  nc_data:
