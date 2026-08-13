@@ -28,9 +28,11 @@ readonly LOCK_FILE="$LOCK_DIR/sync.lock"
 readonly SSH_CONFIG="$CONFIG_DIR/ssh_config"
 readonly VALIDATOR="/usr/local/lib/samba-nextcloud/validate-nextcloud-state.jq"
 readonly PLAN_BUILDER="/usr/local/lib/samba-nextcloud/build-sync-plan.jq"
+readonly ABSENCE_UPDATER="/usr/local/lib/samba-nextcloud/update-absence-state.jq"
 readonly LAST_GOOD="$LOCAL_STATE_DIR/last-known-good.json"
 readonly LAST_PLAN="$LOCAL_STATE_DIR/last-plan.json"
 readonly PROVISIONING_DIR="$LOCAL_STATE_DIR/provisioning"
+readonly ABSENCE_STATE="$LOCAL_STATE_DIR/absence-state.json"
 readonly MAX_STATE_BYTES=1048576
 readonly DOWNLOAD_FILE_BLOCK_LIMIT=4096
 readonly OCC_DISCOVERY_LIMIT=20000
@@ -47,6 +49,8 @@ SOURCE_PATH="/state.json"
 MAX_AGE_SECONDS=21600
 MAX_FUTURE_SECONDS=300
 EXPECTED_NEXTCLOUD_MAJOR=34
+ABSENCE_MIN_SNAPSHOTS=3
+ABSENCE_MIN_SECONDS=345600
 
 WORK_DIR=""
 CANDIDATE=""
@@ -55,6 +59,7 @@ REVIEWED_GENERATION=""
 CANDIDATE_HASH=""
 EFFECTIVE_MARKERS_FILE=""
 PENDING_USERS_FILE=""
+ABSENCE_CANDIDATE=""
 
 log() {
     local level="$1"
@@ -85,6 +90,7 @@ Uso:
   sync-nextcloud-state --dry-run [--config /caminho/arquivo.conf]
   sync-nextcloud-state --apply-additive --reviewed-generation UUID \
     [--config /caminho/arquivo.conf]
+  sync-nextcloud-state --apply-lifecycle [--config /caminho/arquivo.conf]
 
 O modo aditivo nunca remove memberships, habilita, apaga ou desabilita por
 ausencia. Contas novas sao criadas com senha aleatoria e desabilitadas.
@@ -103,6 +109,11 @@ parse_arguments() {
                 ;;
             --apply-additive)
                 RUN_MODE="apply-additive"
+                selected_modes=$((selected_modes + 1))
+                shift
+                ;;
+            --apply-lifecycle)
+                RUN_MODE="apply-lifecycle"
                 selected_modes=$((selected_modes + 1))
                 shift
                 ;;
@@ -180,6 +191,10 @@ load_configuration() {
         die "$EXIT_CONFIG" "MAX_FUTURE_SECONDS invalido"
     [[ "$EXPECTED_NEXTCLOUD_MAJOR" =~ ^[1-9][0-9]*$ ]] ||
         die "$EXIT_CONFIG" "EXPECTED_NEXTCLOUD_MAJOR invalido"
+    [[ "$ABSENCE_MIN_SNAPSHOTS" =~ ^[1-9][0-9]*$ ]] ||
+        die "$EXIT_CONFIG" "ABSENCE_MIN_SNAPSHOTS invalido"
+    [[ "$ABSENCE_MIN_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+        die "$EXIT_CONFIG" "ABSENCE_MIN_SECONDS invalido"
 }
 
 require_dependencies() {
@@ -195,6 +210,7 @@ require_dependencies() {
     validate_root_owned_file "$SSH_CONFIG"
     validate_root_owned_file "$VALIDATOR"
     validate_root_owned_file "$PLAN_BUILDER"
+    validate_root_owned_file "$ABSENCE_UPDATER"
 }
 
 ensure_directory() {
@@ -378,7 +394,10 @@ discover_nextcloud() {
     local groups_file="$WORK_DIR/groups.json"
     local markers_file="$WORK_DIR/markers.json"
     local marker_entries="$WORK_DIR/marker-entries.jsonl"
+    local metadata_file="$WORK_DIR/user-metadata.json"
+    local metadata_entries="$WORK_DIR/user-metadata.jsonl"
     local installed maintenance upgrade version major user marker
+    local onboarding disabled_by disable_pending enabled info
 
     docker inspect "$CONTAINER" >/dev/null 2>&1 ||
         die "$EXIT_NEXTCLOUD" "Container Nextcloud indisponivel"
@@ -402,6 +421,7 @@ discover_nextcloud() {
     occ_list_bounded "group:list" "$groups_file"
 
     : >"$marker_entries"
+    : >"$metadata_entries"
     while IFS= read -r user; do
         marker="$(occ user:setting "$user" samba_nextcloud_sync managed_by \
             --default-value='' 2>/dev/null)" ||
@@ -409,12 +429,48 @@ discover_nextcloud() {
                 "Falha ao consultar marker do usuario $user"
         jq -nc --arg key "$user" --arg value "$marker" \
             '{key: $key, value: $value}' >>"$marker_entries"
+        onboarding="$(occ user:setting \
+            "$user" samba_nextcloud_sync onboarding_pending \
+            --default-value='' 2>/dev/null)" ||
+            die "$EXIT_OCC_DISCOVERY" \
+                "Falha ao consultar onboarding de $user"
+        disabled_by="$(occ user:setting \
+            "$user" samba_nextcloud_sync disabled_by_sync \
+            --default-value='' 2>/dev/null)" ||
+            die "$EXIT_OCC_DISCOVERY" \
+                "Falha ao consultar disabled_by_sync de $user"
+        disable_pending="$(occ user:setting \
+            "$user" samba_nextcloud_sync disable_pending \
+            --default-value='' 2>/dev/null)" ||
+            die "$EXIT_OCC_DISCOVERY" \
+                "Falha ao consultar disable_pending de $user"
+        info="$(occ user:info "$user" --output=json)" ||
+            die "$EXIT_OCC_DISCOVERY" \
+                "Falha ao consultar info de $user"
+        enabled="$(jq -r '.enabled' <<<"$info")"
+        jq -nc \
+            --arg user "$user" \
+            --arg managed_by "$marker" \
+            --arg onboarding_pending "$onboarding" \
+            --arg disabled_by_sync "$disabled_by" \
+            --arg disable_pending "$disable_pending" \
+            --argjson enabled "$enabled" \
+            '{
+              user: $user,
+              managed_by: $managed_by,
+              onboarding_pending: $onboarding_pending,
+              disabled_by_sync: $disabled_by_sync,
+              disable_pending: $disable_pending,
+              enabled: $enabled
+            }' >>"$metadata_entries"
     done < <(jq -r 'keys[]' "$users_file")
     jq -s 'from_entries' "$marker_entries" >"$markers_file"
+    jq -s '{users: .}' "$metadata_entries" >"$metadata_file"
 
     NC_USERS_FILE="$users_file"
     NC_GROUPS_FILE="$groups_file"
     MARKERS_FILE="$markers_file"
+    NC_METADATA_FILE="$metadata_file"
 }
 
 build_plan() {
@@ -445,7 +501,11 @@ build_plan() {
         die "$EXIT_OCC_DISCOVERY" "Nao foi possivel calcular o plano"
     jq -e '
       type == "object"
-      and (.mode == "dry-run" or .mode == "apply-additive")
+      and (
+        .mode == "dry-run"
+        or .mode == "apply-additive"
+        or .mode == "apply-lifecycle"
+      )
       and (.source_sha256 | test("^[0-9a-f]{64}$"))
       and (.counts | type == "object")
     ' "$WORK_DIR/plan.json" >/dev/null ||
@@ -845,6 +905,302 @@ verify_additive_convergence() {
             "Convergencia aditiva incompleta; restam $remaining acoes"
 }
 
+prepare_absence_state() {
+    local previous="$WORK_DIR/absence-previous.json"
+    local input="$WORK_DIR/absence-input.json"
+    local next="$WORK_DIR/absence-next.json"
+
+    if [[ -e "$ABSENCE_STATE" ]]; then
+        validate_root_owned_file "$ABSENCE_STATE"
+        jq -e '
+          type == "object"
+          and .version == 1
+          and (.users | type == "object")
+        ' "$ABSENCE_STATE" >/dev/null ||
+            die "$EXIT_FILESYSTEM" "Estado local de ausencias invalido"
+        cp -- "$ABSENCE_STATE" "$previous"
+    else
+        echo '{"version":1,"users":{}}' >"$previous"
+    fi
+
+    jq -n \
+        --arg now "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+        --arg generation_id "$(jq -r '.generation_id' "$CANDIDATE")" \
+        --argjson protected_users \
+            "$(printf '%s\n' "${PROTECTED_USERS[@]}" |
+                jq -Rsc 'split("\n") | map(select(length > 0))')" \
+        --slurpfile source "$CANDIDATE" \
+        --slurpfile nextcloud "$NC_METADATA_FILE" \
+        --slurpfile previous "$previous" \
+        '{
+          now: $now,
+          generation_id: $generation_id,
+          source_users: $source[0].users,
+          protected_users: $protected_users,
+          nextcloud: $nextcloud[0],
+          previous: $previous[0]
+        }' >"$input"
+
+    jq -f "$ABSENCE_UPDATER" "$input" >"$next" ||
+        die "$EXIT_FILESYSTEM" "Falha ao atualizar estado de ausencias"
+    ABSENCE_CANDIDATE="$next"
+}
+
+protected_username() {
+    local candidate="$1"
+    local protected
+
+    for protected in "${PROTECTED_USERS[@]}"; do
+        [[ "$candidate" == "$protected" ]] && return 0
+    done
+    return 1
+}
+
+metadata_value() {
+    local user="$1"
+    local field="$2"
+
+    jq -r --arg user "$user" --arg field "$field" \
+        '.users[] | select(.user == $user) | .[$field]' \
+        "$NC_METADATA_FILE"
+}
+
+remove_membership() {
+    local user="$1"
+    local group="$2"
+
+    log "WARN" "Removendo membership user=$user group=$group"
+    occ group:removeuser --quiet "$group" "$user" >/dev/null ||
+        die "$EXIT_PARTIAL" \
+            "Falha ao remover $user do grupo $group"
+}
+
+apply_present_membership_removals() {
+    local user group
+
+    while IFS=$'\t' read -r user group; do
+        [[ -n "$user" && -n "$group" ]] || continue
+        remove_membership "$user" "$group"
+    done < <(jq -r \
+        '.memberships_remove[] | [.user, .group] | @tsv' \
+        "$WORK_DIR/plan.json")
+}
+
+apply_existing_membership_additions() {
+    local user group after_create
+
+    while IFS=$'\t' read -r user group after_create; do
+        [[ -n "$user" && -n "$group" ]] || continue
+        [[ "$after_create" == "false" ]] || continue
+        add_membership "$user" "$group"
+    done < <(jq -r \
+        '.memberships_add[]
+         | [.user, .group, (.after_create | tostring)]
+         | @tsv' "$WORK_DIR/plan.json")
+}
+
+add_source_memberships() {
+    local user="$1"
+    local group
+
+    while IFS= read -r group; do
+        [[ -n "$group" ]] || continue
+        if ! jq -e --arg group "$group" --arg user "$user" \
+            '(.[$group] // []) | index($user) != null' \
+            "$NC_GROUPS_FILE" >/dev/null
+        then
+            add_membership "$user" "$group"
+        fi
+    done < <(jq -r --arg user "$user" \
+        '.managed_groups[] as $group
+         | select(.groups[$group] | index($user) != null)
+         | $group' "$CANDIDATE")
+}
+
+remove_all_managed_memberships() {
+    local user="$1"
+    local group
+
+    while IFS= read -r group; do
+        [[ -n "$group" ]] || continue
+        if jq -e --arg group "$group" --arg user "$user" \
+            '(.[$group] // []) | index($user) != null' \
+            "$NC_GROUPS_FILE" >/dev/null
+        then
+            remove_membership "$user" "$group"
+        fi
+    done < <(jq -r '.managed_groups[]' "$CANDIDATE")
+}
+
+process_returned_users() {
+    local user onboarding enabled disabled_by disable_pending
+
+    while IFS= read -r user; do
+        [[ -n "$user" ]] || continue
+        protected_username "$user" &&
+            die "$EXIT_PARTIAL" \
+                "Conta protegida entrou no retorno lifecycle: $user"
+        log "WARN" "Usuario gerenciado retornou ao Samba: $user"
+        add_source_memberships "$user"
+        onboarding="$(metadata_value "$user" onboarding_pending)"
+        enabled="$(metadata_value "$user" enabled)"
+        disabled_by="$(metadata_value "$user" disabled_by_sync)"
+        disable_pending="$(metadata_value "$user" disable_pending)"
+
+        if [[ "$disable_pending" == "1" && "$enabled" == "false" &&
+            "$disabled_by" != "1" ]]
+        then
+            occ user:setting --quiet \
+                "$user" samba_nextcloud_sync disabled_by_sync "1" \
+                >/dev/null ||
+                die "$EXIT_PARTIAL" \
+                    "Falha ao finalizar marker disabled_by_sync de $user"
+            disabled_by="1"
+        fi
+
+        if [[ "$onboarding" != "1" && "$enabled" == "false" &&
+            "$disabled_by" == "1" ]]
+        then
+            occ user:enable --quiet "$user" >/dev/null ||
+                die "$EXIT_PARTIAL" "Falha ao reabilitar $user"
+        fi
+
+        if [[ "$disabled_by" == "1" ]]; then
+            occ user:setting --quiet --delete \
+                "$user" samba_nextcloud_sync disabled_by_sync >/dev/null ||
+                die "$EXIT_PARTIAL" \
+                    "Falha ao limpar marker disabled_by_sync de $user"
+        fi
+        if [[ "$disable_pending" == "1" ]]; then
+            occ user:setting --quiet --delete \
+                "$user" samba_nextcloud_sync disable_pending >/dev/null ||
+                die "$EXIT_PARTIAL" \
+                    "Falha ao limpar marker disable_pending de $user"
+        fi
+    done < <(jq -r \
+        --slurpfile source "$CANDIDATE" \
+        '.users[]
+         | select(.managed_by == "samba-nextcloud-sync")
+         | select(
+             .disabled_by_sync == "1"
+             or .disable_pending == "1"
+           )
+         | .user as $user
+         | select($source[0].users | index($user) != null)
+         | $user' "$NC_METADATA_FILE")
+}
+
+process_eligible_absences() {
+    local user first_epoch now_epoch age count onboarding enabled
+    local disabled_by disable_pending
+
+    now_epoch="$(date -u +%s)"
+    while IFS=$'\t' read -r user count first_epoch; do
+        [[ -n "$user" ]] || continue
+        protected_username "$user" &&
+            die "$EXIT_PARTIAL" \
+                "Conta protegida entrou na ausencia lifecycle: $user"
+        age=$((now_epoch - first_epoch))
+        if (( count < ABSENCE_MIN_SNAPSHOTS ||
+              age < ABSENCE_MIN_SECONDS )); then
+            continue
+        fi
+
+        log "WARN" \
+            "Ausencia elegivel user=$user snapshots=$count age_seconds=$age"
+        remove_all_managed_memberships "$user"
+        onboarding="$(metadata_value "$user" onboarding_pending)"
+        enabled="$(metadata_value "$user" enabled)"
+        disabled_by="$(metadata_value "$user" disabled_by_sync)"
+        disable_pending="$(metadata_value "$user" disable_pending)"
+
+        if [[ "$onboarding" == "1" ]]; then
+            if [[ "$enabled" == "true" ]]; then
+                occ user:disable --quiet "$user" >/dev/null ||
+                    die "$EXIT_PARTIAL" \
+                        "Falha ao desabilitar onboarding ausente $user"
+            fi
+            continue
+        fi
+
+        if [[ "$enabled" == "true" && "$disable_pending" != "1" ]]; then
+            occ user:setting --quiet \
+                "$user" samba_nextcloud_sync disable_pending "1" \
+                >/dev/null ||
+                die "$EXIT_PARTIAL" \
+                    "Falha ao marcar disable_pending de $user"
+            disable_pending="1"
+        fi
+
+        if [[ "$enabled" == "true" ]]; then
+            occ user:disable --quiet "$user" >/dev/null ||
+                die "$EXIT_PARTIAL" "Falha ao desabilitar $user"
+            enabled="false"
+        fi
+
+        if [[ "$disable_pending" == "1" && "$disabled_by" != "1" ]]; then
+            occ user:setting --quiet \
+                "$user" samba_nextcloud_sync disabled_by_sync "1" \
+                >/dev/null ||
+                die "$EXIT_PARTIAL" \
+                    "Falha ao marcar disabled_by_sync de $user"
+            disabled_by="1"
+        fi
+        if [[ "$disable_pending" == "1" && "$disabled_by" == "1" ]]; then
+            occ user:setting --quiet --delete \
+                "$user" samba_nextcloud_sync disable_pending >/dev/null ||
+                die "$EXIT_PARTIAL" \
+                    "Falha ao limpar disable_pending de $user"
+        fi
+    done < <(jq -r '
+      .users
+      | to_entries[]
+      | [
+          .key,
+          (.value.consecutive_snapshots | tostring),
+          (.value.first_absent_at | fromdateiso8601 | tostring)
+        ]
+      | @tsv
+    ' "$ABSENCE_CANDIDATE")
+}
+
+apply_lifecycle_plan() {
+    local new_users
+
+    new_users="$(jq -r '.counts.new_users' "$WORK_DIR/plan.json")"
+    [[ "$new_users" -eq 0 ]] ||
+        die "$EXIT_CONFIG" \
+            "Existem $new_users usuarios novos; execute dry-run e apply aditivo"
+
+    while IFS= read -r group; do
+        [[ -n "$group" ]] || continue
+        ensure_group "$group"
+    done < <(jq -r '.missing_groups[]' "$WORK_DIR/plan.json")
+
+    apply_existing_membership_additions
+    apply_present_membership_removals
+    process_returned_users
+    process_eligible_absences
+}
+
+verify_lifecycle_convergence() {
+    local remaining
+
+    discover_nextcloud
+    prepare_effective_markers
+    build_plan
+    remaining="$(jq '
+      .counts.missing_groups
+      + .counts.new_users
+      + .counts.conflicts
+      + .counts.memberships_add
+      + .counts.memberships_remove
+    ' "$WORK_DIR/plan.json")"
+    [[ "$remaining" -eq 0 ]] ||
+        die "$EXIT_PARTIAL" \
+            "Convergencia lifecycle incompleta; restam $remaining acoes"
+}
+
 publish_local_state() {
     local destination="$1"
     local source="$2"
@@ -921,11 +1277,17 @@ main() {
             "$conflicts conta(s) Nextcloud preexistente(s) sem marker"
     fi
 
+    prepare_absence_state
+
     if [[ "$RUN_MODE" == "apply-additive" ]]; then
         publish_local_state \
             "last-applied-plan.json" "$WORK_DIR/plan.json" 0600
         apply_additive_plan
         verify_additive_convergence
+        publish_local_state "last-plan.json" "$WORK_DIR/plan.json" 0600
+    elif [[ "$RUN_MODE" == "apply-lifecycle" ]]; then
+        apply_lifecycle_plan
+        verify_lifecycle_convergence
         publish_local_state "last-plan.json" "$WORK_DIR/plan.json" 0600
     else
         publish_local_state "last-plan.json" "$WORK_DIR/plan.json" 0600
@@ -934,6 +1296,8 @@ main() {
     if [[ "$SAME_GENERATION" -eq 0 ]]; then
         publish_local_state "last-known-good.json" "$CANDIDATE" 0600
     fi
+    publish_local_state \
+        "absence-state.json" "$ABSENCE_CANDIDATE" 0600
 
     report_plan
 }

@@ -128,6 +128,32 @@ Depois de revisar o plano, `--apply-additive` pode:
 O modo aditivo não remove memberships, não habilita contas, não processa
 ausências e nunca apaga usuários ou arquivos.
 
+## Lifecycle seguro
+
+`--apply-lifecycle` executa convergência de memberships de contas já
+gerenciadas e mantém um estado local de ausências. Uma conta somente é
+desabilitada quando:
+
+- está ausente em pelo menos 3 snapshots saudáveis consecutivos;
+- passaram pelo menos 4 dias desde a primeira ausência saudável;
+- possui marker `managed_by=samba-nextcloud-sync`;
+- nenhum circuit breaker está ativo;
+- não é uma conta protegida.
+
+Ao atingir a carência, os cinco memberships gerenciados são removidos e a
+conta é desabilitada. Nunca há `user:delete` ou purge. Se o usuário retornar,
+somente uma conta com marker `disabled_by_sync=1` pode ser reabilitada
+automaticamente. Contas ainda com `onboarding_pending=1` nunca são habilitadas
+automaticamente.
+
+O marker transitório `disable_pending=1` torna uma falha entre marcação e
+desativação recuperável. O estado de ausências é preparado a cada snapshot
+saudável, inclusive em dry-run, mas só é persistido após a execução inteira
+terminar com sucesso.
+
+Antes de habilitar esse modo em produção, faça snapshots das VMs conforme o
+procedimento operacional.
+
 Instale:
 
 ```bash
@@ -138,6 +164,10 @@ install -o root -g root -m 0755 \
 install -D -o root -g root -m 0644 \
   nextcloud/lib/build-sync-plan.jq \
   /usr/local/lib/samba-nextcloud/build-sync-plan.jq
+
+install -D -o root -g root -m 0644 \
+  nextcloud/lib/update-absence-state.jq \
+  /usr/local/lib/samba-nextcloud/update-absence-state.jq
 
 install -o root -g root -m 0640 \
   nextcloud/nextcloud-sync.conf.example \
