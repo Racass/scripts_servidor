@@ -181,6 +181,20 @@ CREDENTIALS="/root/.legacy-smb-credentials"</code></pre>
         Nextcloud existente e o nome exato do compartilhamento SMB.
       </div>
 
+      <p>Antes de cada bloco executado em uma nova sessão shell, redefina as
+        variáveis acima e valide:</p>
+      <pre><code>: "${SMB_HOST:?SMB_HOST não definido}"
+: "${SMB_SHARE:?SMB_SHARE não definido}"
+: "${NC_USER:?NC_USER não definido}"
+: "${SMB_MOUNT:?SMB_MOUNT não definido}"
+: "${SOURCE:?SOURCE não definido}"
+: "${CREDENTIALS:?CREDENTIALS não definido}"
+
+[[ "$SMB_SHARE" != "NOME_DO_SHARE" ]] || {
+  echo "Substitua NOME_DO_SHARE pelo nome real" &gt;&amp;2
+  exit 1
+}</code></pre>
+
       <p>Valide o destino antes de copiar:</p>
       <pre><code>docker exec -u www-data nextcloud-app \
   php occ user:info "$NC_USER"
@@ -236,7 +250,15 @@ smbclient -L "//$SMB_HOST" -U admin -m SMB3</code></pre>
 
     <section id="montar">
       <h2><span class="step">3</span>Criar credencial temporária e montar</h2>
-      <pre><code>install -d -o root -g root -m 0700 "$SMB_MOUNT"
+      <pre><code>set -euo pipefail
+: "${SMB_HOST:?SMB_HOST não definido}"
+: "${SMB_SHARE:?SMB_SHARE não definido}"
+: "${SMB_MOUNT:?SMB_MOUNT não definido}"
+: "${SOURCE:?SOURCE não definido}"
+: "${CREDENTIALS:?CREDENTIALS não definido}"
+
+cd /root
+install -d -o root -g root -m 0700 "$SMB_MOUNT"
 install -d -o root -g root -m 0700 "$STAGING_ROOT"
 
 read -r -s -p "Senha SMB do usuário admin: " SMB_PASSWORD
@@ -247,10 +269,18 @@ printf 'username=admin\npassword=%s\n' "$SMB_PASSWORD" \
 unset SMB_PASSWORD
 chmod 0600 "$CREDENTIALS"
 
+mountpoint -q "$SMB_MOUNT" &amp;&amp; {
+  echo "O mountpoint já está montado" &gt;&amp;2
+  exit 1
+}
+
 mount -t cifs "//$SMB_HOST/$SMB_SHARE" "$SMB_MOUNT" \
   -o "credentials=$CREDENTIALS,ro,vers=3.0,iocharset=utf8,noserverino,uid=0,gid=0,file_mode=0444,dir_mode=0555"
 
-findmnt "$SMB_MOUNT"
+[[ "$(findmnt -n -o FSTYPE --target "$SMB_MOUNT")" == "cifs" ]]
+findmnt -n -o OPTIONS --target "$SMB_MOUNT" |
+  tr ',' '\n' | grep -Fx ro
+findmnt --target "$SMB_MOUNT"
 test -d "$SOURCE"
 if touch "$SMB_MOUNT/.write-test"; then
   rm -f "$SMB_MOUNT/.write-test"
