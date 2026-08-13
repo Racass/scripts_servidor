@@ -1,0 +1,20 @@
+[Unit]
+Description=Valida em dry-run o estado Samba para Nextcloud
+Documentation=file:/usr/local/share/doc/samba-nextcloud/STATE-CONTRACT.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/bash -c 'for attempt in {1..30}; do /usr/bin/docker exec -u www-data nextcloud-app php occ status >/dev/null 2>&1 && exit 0; sleep 10; done; exit 1'
+ExecStart=/usr/local/sbin/sync-nextcloud-state --dry-run
+UMask=0077
+RuntimeDirectory=samba-nextcloud-sync
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=samba-nextcloud-sync
+StateDirectoryMode=0700
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true

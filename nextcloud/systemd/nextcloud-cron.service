@@ -1,0 +1,15 @@
+[Unit]
+Description=Executa os background jobs do Nextcloud
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/bash -c 'for attempt in {1..30}; do /usr/bin/docker exec -u www-data nextcloud-app php occ status >/dev/null 2>&1 && exit 0; sleep 10; done; exit 1'
+ExecStart=/usr/bin/docker exec -u www-data nextcloud-app php -f cron.php
+TimeoutStartSec=10min
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+NoNewPrivileges=true
+PrivateTmp=true

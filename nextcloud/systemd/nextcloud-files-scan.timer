@@ -1,0 +1,11 @@
+[Unit]
+Description=Atualiza o indice de arquivos externos sem sobreposicao
+
+[Timer]
+OnActiveSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=nextcloud-files-scan.service
+
+[Install]
+WantedBy=timers.target

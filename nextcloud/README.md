@@ -201,3 +201,22 @@ tratado como conflito e nunca é adotado automaticamente.
 
 As contas `admin` e `nextcloud_user` são protegidas. O consumidor rejeita
 qualquer snapshot que contenha uma delas.
+
+## Timers systemd
+
+O instalador `install-systemd-schedulers` salva o estado anterior, substitui
+somente as duas linhas cron legadas conhecidas e testa as unidades sem manter
+agendadores duplicados. Se a migração falhar, restaura units, timers e crontab;
+um job já iniciado termina antes de o cron anterior voltar:
+
+- `nextcloud-cron.timer`: `cron.php` a cada cinco minutos;
+- `nextcloud-files-scan.timer`: `files:scan --all` a cada cinco minutos após
+  a execução anterior terminar, com prioridade reduzida;
+- `sync-nextcloud-state.timer`: sincronização horária somente em `dry-run`.
+
+O lifecycle destrutivo permanece manual para permitir snapshots e revisão
+antes de remoções de memberships ou desativações.
+
+```bash
+sudo bash nextcloud/install-systemd-schedulers
+```

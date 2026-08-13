@@ -1,0 +1,304 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+umask 077
+
+readonly REPO_DEFAULT="/home/rafael/git/scripts_servidor"
+readonly CRON_SCAN='*/5 * * * * docker exec -u www-data nextcloud-app php occ files:scan --all >> /var/log/nextcloud-scan.log 2>&1'
+readonly CRON_JOBS='*/5 * * * * docker exec -u www-data nextcloud-app php cron.php >> /var/log/nextcloud-cron.log 2>&1'
+
+REPO="$REPO_DEFAULT"
+BACKUP_DIR=""
+HAD_CRONTAB=0
+CRON_CHANGED=0
+MIGRATION_COMPLETE=0
+SERVICES_STARTED=0
+declare -a TIMERS=(
+    nextcloud-cron.timer
+    nextcloud-files-scan.timer
+    sync-nextcloud-state.timer
+)
+declare -a UNITS=(
+    nextcloud-cron.service
+    nextcloud-cron.timer
+    nextcloud-files-scan.service
+    nextcloud-files-scan.timer
+    sync-nextcloud-state.service
+    sync-nextcloud-state.timer
+)
+declare -A TIMER_WAS_ACTIVE=()
+declare -A TIMER_WAS_ENABLED=()
+declare -A UNIT_EXISTED=()
+
+log() {
+    local level="$1"
+    shift
+    printf '[%s] %s\n' "$level" "$*" >&2
+}
+
+die() {
+    log "ERROR" "$2"
+    exit "$1"
+}
+
+rollback() {
+    local rc=$?
+    local rollback_failed=0
+    local restore_cron=1
+    local timer
+    local unit
+
+    if [[ "$MIGRATION_COMPLETE" -eq 0 ]]; then
+        for timer in "${TIMERS[@]}"; do
+            if systemctl cat "$timer" >/dev/null 2>&1; then
+                if systemctl is-active --quiet "$timer"; then
+                    systemctl stop "$timer" >/dev/null 2>&1 ||
+                        rollback_failed=1
+                fi
+                systemctl disable "$timer" >/dev/null 2>&1 ||
+                    rollback_failed=1
+            fi
+        done
+
+        if [[ "$SERVICES_STARTED" -eq 1 ]] &&
+            ! wait_container_jobs 2200
+        then
+            restore_cron=0
+            rollback_failed=1
+        fi
+
+        for unit in "${UNITS[@]}"; do
+            if [[ "${UNIT_EXISTED[$unit]}" -eq 1 ]]; then
+                install -o root -g root -m 0644 \
+                    "$BACKUP_DIR/units/$unit" \
+                    "/etc/systemd/system/$unit" ||
+                    rollback_failed=1
+            else
+                rm -f "/etc/systemd/system/$unit" ||
+                    rollback_failed=1
+            fi
+        done
+        systemctl daemon-reload || rollback_failed=1
+
+        for timer in "${TIMERS[@]}"; do
+            if [[ "${UNIT_EXISTED[$timer]}" -eq 0 ]]; then
+                continue
+            fi
+            if [[ "${TIMER_WAS_ENABLED[$timer]}" -eq 1 ]]; then
+                systemctl enable "$timer" >/dev/null 2>&1 ||
+                    rollback_failed=1
+            else
+                systemctl disable "$timer" >/dev/null 2>&1 ||
+                    rollback_failed=1
+            fi
+
+            if [[ "${TIMER_WAS_ACTIVE[$timer]}" -eq 1 ]]; then
+                systemctl start "$timer" >/dev/null 2>&1 ||
+                    rollback_failed=1
+            else
+                systemctl stop "$timer" >/dev/null 2>&1 ||
+                    rollback_failed=1
+            fi
+        done
+    fi
+
+    if [[ "$MIGRATION_COMPLETE" -eq 0 && "$CRON_CHANGED" -eq 1 &&
+        "$restore_cron" -eq 1 ]]
+    then
+        if [[ "$HAD_CRONTAB" -eq 1 ]]; then
+            crontab "$BACKUP_DIR/root-crontab.before" ||
+                rollback_failed=1
+        else
+            crontab -r >/dev/null 2>&1 ||
+                rollback_failed=1
+        fi
+    fi
+
+    if [[ "$MIGRATION_COMPLETE" -eq 0 ]]; then
+        if [[ "$rollback_failed" -eq 0 ]]; then
+            log "WARN" "Migracao falhou; estado anterior restaurado"
+        else
+            log "ERROR" "Migracao falhou e o rollback ficou incompleto"
+        fi
+    fi
+    exit "$rc"
+}
+
+usage() {
+    echo "Uso: install-systemd-schedulers [--repo CAMINHO]" >&2
+}
+
+parse_arguments() {
+    if [[ $# -eq 0 ]]; then
+        return
+    fi
+    if [[ $# -eq 2 && "$1" == "--repo" ]]; then
+        REPO="$2"
+        return
+    fi
+    usage
+    exit 10
+}
+
+require_dependencies() {
+    local command
+    for command in crontab date diff docker grep install rm sleep systemctl \
+        systemd-analyze
+    do
+        command -v "$command" >/dev/null 2>&1 ||
+            die 11 "Dependencia ausente: $command"
+    done
+}
+
+install_units() {
+    local unit
+    local -a unit_paths=()
+
+    for unit in "${UNITS[@]}"; do
+        [[ -f "$REPO/nextcloud/systemd/$unit" ]] ||
+            die 10 "Unidade ausente no repositorio: $unit"
+        install -o root -g root -m 0644 \
+            "$REPO/nextcloud/systemd/$unit" \
+            "/etc/systemd/system/$unit"
+        unit_paths+=("/etc/systemd/system/$unit")
+    done
+
+    systemd-analyze verify "${unit_paths[@]}"
+    systemctl daemon-reload
+}
+
+backup_unit_files() {
+    local unit
+
+    install -d -o root -g root -m 0700 "$BACKUP_DIR/units"
+    for unit in "${UNITS[@]}"; do
+        if [[ -f "/etc/systemd/system/$unit" ]]; then
+            UNIT_EXISTED["$unit"]=1
+            install -o root -g root -m 0600 \
+                "/etc/systemd/system/$unit" \
+                "$BACKUP_DIR/units/$unit"
+        else
+            UNIT_EXISTED["$unit"]=0
+        fi
+    done
+}
+
+capture_timer_state() {
+    local timer
+
+    for timer in "${TIMERS[@]}"; do
+        if systemctl is-enabled --quiet "$timer" 2>/dev/null; then
+            TIMER_WAS_ENABLED["$timer"]=1
+        else
+            TIMER_WAS_ENABLED["$timer"]=0
+        fi
+
+        if systemctl is-active --quiet "$timer" 2>/dev/null; then
+            TIMER_WAS_ACTIVE["$timer"]=1
+        else
+            TIMER_WAS_ACTIVE["$timer"]=0
+        fi
+    done
+}
+
+prepare_legacy_cron() {
+    local current="$BACKUP_DIR/root-crontab.before"
+    local filtered="$BACKUP_DIR/root-crontab.after"
+    local error_file="$BACKUP_DIR/root-crontab.error"
+
+    if crontab -l >"$current" 2>"$error_file"; then
+        HAD_CRONTAB=1
+    elif grep -Fq 'no crontab for' "$error_file"; then
+        HAD_CRONTAB=0
+        : >"$current"
+    else
+        die 70 "Nao foi possivel ler o crontab root"
+    fi
+
+    if grep -Fvx -e "$CRON_SCAN" -e "$CRON_JOBS" \
+        "$current" >"$filtered"
+    then
+        :
+    else
+        local grep_status=$?
+        [[ "$grep_status" -eq 1 ]] ||
+            die 70 "Falha ao filtrar o crontab root"
+    fi
+
+    if diff -q "$current" "$filtered" >/dev/null; then
+        log "INFO" "Nenhuma entrada cron legada encontrada"
+        return
+    fi
+
+    if [[ -s "$filtered" ]]; then
+        crontab "$filtered"
+    else
+        crontab -r
+    fi
+    CRON_CHANGED=1
+    log "INFO" "Entradas cron legadas removidas"
+}
+
+wait_container_jobs() {
+    local max_attempts="$1"
+    local attempt
+    local processes
+
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        if ! processes="$(docker top nextcloud-app -eo args 2>/dev/null)"; then
+            log "ERROR" "Nao foi possivel inspecionar processos do Nextcloud"
+            return 2
+        fi
+        if ! grep -Eq \
+            '[f]iles:scan --all|php( -f)? [^ ]*cron\.php' \
+            <<<"$processes"
+        then
+            return
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_legacy_jobs() {
+    wait_container_jobs 60 ||
+        die 70 "Job cron legado continuou ativo por mais de 60 segundos"
+}
+
+enable_and_test() {
+    SERVICES_STARTED=1
+    systemctl enable --now nextcloud-cron.timer
+    systemctl start nextcloud-cron.service
+
+    systemctl enable --now nextcloud-files-scan.timer
+    systemctl start nextcloud-files-scan.service
+
+    systemctl enable --now sync-nextcloud-state.timer
+    systemctl start sync-nextcloud-state.service
+}
+
+main() {
+    parse_arguments "$@"
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] ||
+        die 12 "Execute como root"
+    [[ "$REPO" == /* && -d "$REPO/.git" ]] ||
+        die 10 "Repositorio invalido: $REPO"
+
+    require_dependencies
+    BACKUP_DIR="/root/backup-nextcloud-schedulers-$(date -u +%Y%m%dT%H%M%SZ)"
+    install -d -o root -g root -m 0700 "$BACKUP_DIR"
+
+    backup_unit_files
+    capture_timer_state
+    trap rollback EXIT
+    install_units
+    prepare_legacy_cron
+    wait_legacy_jobs
+    enable_and_test
+    MIGRATION_COMPLETE=1
+    trap - EXIT
+
+    log "INFO" "Agendadores systemd instalados; backup: $BACKUP_DIR"
+}
+
+main "$@"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Valida o estado Samba para Nextcloud a cada hora
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5min
+AccuracySec=1min
+Unit=sync-nextcloud-state.service
+
+[Install]
+WantedBy=timers.target
