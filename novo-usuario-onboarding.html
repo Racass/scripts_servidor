@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Novo usuário Samba + Nextcloud — Step by step</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #5d687c;
+      --line: #dbe2ee;
+      --paper: #ffffff;
+      --page: #f3f6fb;
+      --blue: #0969da;
+      --green: #18794e;
+      --amber: #9a6700;
+      --red: #cf222e;
+      --code: #111827;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    header {
+      color: white;
+      background: linear-gradient(130deg, #172554, #0969da);
+      padding: 42px 22px;
+    }
+    header div, main { max-width: 980px; margin: auto; }
+    h1 { margin: 0 0 8px; font-size: clamp(28px, 5vw, 46px); }
+    h2 { margin-top: 0; }
+    h3 { margin-bottom: 8px; }
+    header p { margin: 0; max-width: 760px; opacity: .92; }
+    main { padding: 28px 18px 70px; }
+    nav, section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 5px 18px rgba(23, 32, 51, .05);
+    }
+    nav { padding: 18px 22px; margin-bottom: 20px; }
+    nav a { color: var(--blue); margin-right: 18px; white-space: nowrap; }
+    section { padding: 26px; margin: 18px 0; }
+    .step {
+      display: inline-grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      margin-right: 8px;
+      border-radius: 50%;
+      color: white;
+      background: var(--blue);
+      font-weight: 800;
+    }
+    .check {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      margin: 10px 0;
+    }
+    .check input { width: 20px; height: 20px; margin-top: 2px; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    pre {
+      overflow-x: auto;
+      padding: 17px;
+      color: #e5edf9;
+      background: var(--code);
+      border-radius: 9px;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+    .notice {
+      padding: 14px 16px;
+      border-left: 5px solid;
+      border-radius: 7px;
+      margin: 14px 0;
+    }
+    .info { background: #eef6ff; border-color: var(--blue); }
+    .ok { background: #edf9f2; border-color: var(--green); }
+    .warn { background: #fff8df; border-color: var(--amber); }
+    .danger { background: #fff0f0; border-color: var(--red); }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+    th, td { padding: 10px; text-align: left; border: 1px solid var(--line); }
+    th { background: #f7f9fc; }
+    .fields {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .field {
+      min-height: 70px;
+      padding: 10px;
+      border: 1px dashed #9aa7ba;
+      border-radius: 8px;
+    }
+    .field strong { display: block; margin-bottom: 18px; }
+    footer { color: var(--muted); text-align: center; padding: 0 20px 40px; }
+    @media print {
+      body { background: white; font-size: 12px; }
+      header { padding: 20px; }
+      nav { display: none; }
+      section { box-shadow: none; break-inside: avoid; }
+      pre { white-space: pre-wrap; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Novo usuário Samba + Nextcloud</h1>
+      <p>Checklist humano, do cadastro no fileserver ao primeiro login.
+        Samba é a fonte de verdade; a senha Nextcloud é independente.</p>
+    </div>
+  </header>
+
+  <main>
+    <nav aria-label="Etapas">
+      <strong>Ir para:</strong>
+      <a href="#preparar">Preparar</a>
+      <a href="#samba">Samba</a>
+      <a href="#sync">Sincronizar</a>
+      <a href="#onboarding">Onboarding</a>
+      <a href="#validar">Validar</a>
+      <a href="#falhas">Falhas</a>
+    </nav>
+
+    <section id="preparar">
+      <h2><span class="step">1</span>Preparar a solicitação</h2>
+      <div class="fields">
+        <div class="field"><strong>Username Linux/Samba</strong></div>
+        <div class="field"><strong>Nome da pessoa</strong></div>
+        <div class="field"><strong>Solicitante/aprovador</strong></div>
+        <div class="field"><strong>Data e operador</strong></div>
+      </div>
+
+      <h3>Escolha os grupos</h3>
+      <table>
+        <thead>
+          <tr><th>Grupo</th><th>Acesso</th><th>Marcar</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>samba-users</code></td><td>Publico e pasta pessoal</td><td>Obrigatório</td></tr>
+          <tr><td><code>samba-admin</code></td><td>Todos os shares, sem admin da aplicação</td><td>☐</td></tr>
+          <tr><td><code>samba-laudos</code></td><td>Laudos</td><td>☐</td></tr>
+          <tr><td><code>samba-laudos-mega</code></td><td>Laudos-Mega</td><td>☐</td></tr>
+          <tr><td><code>samba-administrativo</code></td><td>Administrativo</td><td>☐</td></tr>
+        </tbody>
+      </table>
+
+      <div class="notice danger">
+        <strong>Proibido:</strong> usar <code>admin</code> ou
+        <code>nextcloud_user</code>. Não reutilize uma conta existente e não
+        conceda o grupo interno <code>admin</code> do Nextcloud.
+      </div>
+      <label class="check"><input type="checkbox"> Aprovação e grupos confirmados.</label>
+      <label class="check"><input type="checkbox"> Username em minúsculas, sem espaços e sem acentos.</label>
+    </section>
+
+    <section id="samba">
+      <h2><span class="step">2</span>Criar no fileserver</h2>
+      <div class="notice warn">
+        O criador de usuários original não está versionado neste repositório.
+        O bloco abaixo é o procedimento manual compatível com o estado atual.
+        Se o script oficial for recuperado, prefira-o e mantenha suas rotinas
+        de backup, rollback, ACL e <code>testparm</code>.
+      </div>
+
+      <p>Entre em <code>fileserver.corp</code> como root e defina o username:</p>
+      <pre><code>NOVO_USUARIO="nome_em_minusculas"
+
+[[ "$NOVO_USUARIO" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || exit 1
+[[ "$NOVO_USUARIO" != "admin" ]] || exit 1
+[[ "$NOVO_USUARIO" != "nextcloud_user" ]] || exit 1
+! getent passwd "$NOVO_USUARIO" &gt;/dev/null || exit 1
+! pdbedit -L | cut -d: -f1 | grep -Fxq "$NOVO_USUARIO" || exit 1</code></pre>
+
+      <p>Crie a identidade Linux bloqueada para senha local:</p>
+      <pre><code>adduser --disabled-password --gecos "" "$NOVO_USUARIO"
+usermod -aG samba-users "$NOVO_USUARIO"</code></pre>
+
+      <p>Adicione somente os grupos aprovados:</p>
+      <pre><code># Execute apenas as linhas aprovadas:
+usermod -aG samba-admin "$NOVO_USUARIO"
+usermod -aG samba-laudos "$NOVO_USUARIO"
+usermod -aG samba-laudos-mega "$NOVO_USUARIO"
+usermod -aG samba-administrativo "$NOVO_USUARIO"</code></pre>
+
+      <p>Crie a senha Samba interativamente:</p>
+      <pre><code>smbpasswd -a "$NOVO_USUARIO"</code></pre>
+
+      <div class="notice info">
+        A senha digitada aqui é a senha Samba. Ela não será enviada ao
+        Nextcloud e não deve aparecer em ticket, terminal compartilhado ou
+        arquivo.
+      </div>
+
+      <p>Crie a pasta pessoal e replique o padrão de ACL validado:</p>
+      <pre><code>PASTA="/srv/files/usuarios/$NOVO_USUARIO"
+
+install -d -o "$NOVO_USUARIO" -g samba-users -m 2770 "$PASTA"
+setfacl -b "$PASTA"
+setfacl -m \
+  "u::rwx,u:${NOVO_USUARIO}:rwx,g::---,g:samba-users:---,g:samba-admin:rwx,m::rwx,o::---" \
+  "$PASTA"
+setfacl -d -m \
+  "u::rwx,g::---,g:samba-admin:rwx,m::rwx,o::---" \
+  "$PASTA"</code></pre>
+
+      <p>Valide antes de exportar:</p>
+      <pre><code>id "$NOVO_USUARIO"
+pdbedit -Lv "$NOVO_USUARIO" |
+  sed -n '/^Unix username:/p;/^Account Flags:/p'
+stat -c '%a %U:%G %n' "$PASTA"
+getfacl -cp "$PASTA"
+testparm -s /etc/samba/fileserver.conf &gt;/dev/null</code></pre>
+
+      <p>A saída de <code>getfacl -cp "$PASTA"</code> deve seguir exatamente
+        este padrão auditado em uma pasta válida:</p>
+      <pre><code>user::rwx
+user:NOME_DO_USUARIO:rwx
+group::---
+group:samba-users:---
+group:samba-admin:rwx
+mask::rwx
+other::---
+default:user::rwx
+default:group::---
+default:group:samba-admin:rwx
+default:mask::rwx
+default:other::---</code></pre>
+      <div class="notice danger">
+        Não continue se houver permissão para <code>other</code>,
+        <code>samba-users</code> ou algum usuário inesperado.
+      </div>
+
+      <label class="check"><input type="checkbox"> Usuário Linux criado e senha local bloqueada.</label>
+      <label class="check"><input type="checkbox"> Usuário tdbsam criado.</label>
+      <label class="check"><input type="checkbox"> Somente grupos aprovados foram adicionados.</label>
+      <label class="check"><input type="checkbox"> Pasta pessoal está <code>2770 usuário:samba-users</code>.</label>
+      <label class="check"><input type="checkbox"> ACL permite usuário e <code>samba-admin</code>, mas não outros usuários.</label>
+    </section>
+
+    <section id="sync">
+      <h2><span class="step">3</span>Exportar e criar a réplica Nextcloud</h2>
+      <p>No fileserver:</p>
+      <pre><code>systemctl start export-nextcloud-state.service
+systemctl show export-nextcloud-state.service \
+  -p Result -p ExecMainStatus
+
+jq --arg u "$NOVO_USUARIO" '
+  {
+    present: (.users | index($u) != null),
+    groups: [
+      .groups
+      | to_entries[]
+      | select(.value | index($u) != null)
+      | .key
+    ]
+  }
+' /var/lib/samba-nextcloud-export/state.json</code></pre>
+
+      <div class="notice danger">
+        Pare se <code>present</code> não for <code>true</code> ou se os grupos
+        não forem exatamente os aprovados.
+      </div>
+
+      <p>No host Nextcloud:</p>
+      <pre><code>NOVO_USUARIO="mesmo_nome_usado_no_fileserver"
+
+sync-nextcloud-state --dry-run
+
+jq '{
+  generation_id,
+  new_users,
+  conflicting_users,
+  memberships_add,
+  memberships_remove,
+  counts
+}' /var/lib/samba-nextcloud-sync/state/last-plan.json</code></pre>
+
+      <p>O plano deve mostrar:</p>
+      <ul>
+        <li>o novo username em <code>new_users</code>;</li>
+        <li>zero conflitos;</li>
+        <li>somente memberships aprovados em <code>memberships_add</code>;</li>
+        <li>zero remoções inesperadas.</li>
+      </ul>
+
+      <pre><code>GENERATION="$(
+  jq -r '.generation_id' \
+    /var/lib/samba-nextcloud-sync/state/last-plan.json
+)"
+
+sync-nextcloud-state \
+  --apply-additive \
+  --reviewed-generation "$GENERATION"</code></pre>
+
+      <p>Confirme a conta desabilitada e marcada:</p>
+      <pre><code>docker exec -u www-data nextcloud-app \
+  php occ user:info "$NOVO_USUARIO"
+
+docker exec -u www-data nextcloud-app php occ user:setting \
+  "$NOVO_USUARIO" samba_nextcloud_sync managed_by \
+  --default-value=''
+
+docker exec -u www-data nextcloud-app php occ user:setting \
+  "$NOVO_USUARIO" samba_nextcloud_sync onboarding_pending \
+  --default-value=''</code></pre>
+
+      <p>Os comandos <code>user:setting</code> acima apenas consultam os
+        markers; <code>--default-value=''</code> não altera seu conteúdo.</p>
+
+      <div class="notice ok">
+        Resultado esperado: conta desabilitada,
+        <code>managed_by=samba-nextcloud-sync</code> e
+        <code>onboarding_pending=1</code>.
+      </div>
+      <label class="check"><input type="checkbox"> Dry-run revisado e generation anotada.</label>
+      <label class="check"><input type="checkbox"> Apply aditivo terminou com exit code 0.</label>
+      <label class="check"><input type="checkbox"> Conta continua desabilitada.</label>
+    </section>
+
+    <section id="onboarding">
+      <h2><span class="step">4</span>Fazer o onboarding</h2>
+      <p>Defina uma senha Nextcloud independente, interativamente:</p>
+      <pre><code>docker exec -it -u www-data nextcloud-app \
+  php occ user:resetpassword "$NOVO_USUARIO"</code></pre>
+
+      <div class="notice warn">
+        Não copie automaticamente a senha Samba. Nunca passe a senha em
+        argumento, variável persistente, arquivo ou log.
+      </div>
+
+      <p>Somente depois da senha ser definida:</p>
+      <pre><code>docker exec -u www-data nextcloud-app php occ user:setting \
+  --delete "$NOVO_USUARIO" \
+  samba_nextcloud_sync onboarding_pending
+
+docker exec -u www-data nextcloud-app \
+  php occ user:enable "$NOVO_USUARIO"</code></pre>
+
+      <p>Confirme:</p>
+      <pre><code>docker exec -u www-data nextcloud-app \
+  php occ user:info "$NOVO_USUARIO"
+
+docker exec -u www-data nextcloud-app php occ user:setting \
+  "$NOVO_USUARIO" samba_nextcloud_sync onboarding_pending \
+  --default-value=''</code></pre>
+
+      <p>Resultado esperado: <code>enabled: true</code> e marker de onboarding
+        vazio, preservando <code>managed_by</code>.</p>
+
+      <label class="check"><input type="checkbox"> Senha Nextcloud definida de forma interativa.</label>
+      <label class="check"><input type="checkbox"> Marker de onboarding removido.</label>
+      <label class="check"><input type="checkbox"> Conta habilitada.</label>
+    </section>
+
+    <section id="validar">
+      <h2><span class="step">5</span>Validar com a pessoa</h2>
+      <ol>
+        <li>Conecte ao WARP e abra
+          <code>https://cloud.applaupertec.com</code>.</li>
+        <li>Faça login com a nova senha Nextcloud.</li>
+        <li>Confirme que <strong>Minha pasta</strong> abre a pasta exclusiva
+          do usuário.</li>
+        <li>Confirme <strong>Publico</strong>.</li>
+        <li>Confirme somente os storages opcionais correspondentes aos grupos.</li>
+        <li>Teste criação e leitura de um arquivo não sensível.</li>
+        <li>Sem WARP, confirme o acesso público pelo mesmo hostname.</li>
+      </ol>
+
+      <table>
+        <thead><tr><th>Grupo</th><th>Storage esperado</th></tr></thead>
+        <tbody>
+          <tr><td><code>samba-users</code></td><td>Publico e Minha pasta</td></tr>
+          <tr><td><code>samba-admin</code></td><td>Todos e Usuarios - Administração</td></tr>
+          <tr><td><code>samba-laudos</code></td><td>Laudos</td></tr>
+          <tr><td><code>samba-laudos-mega</code></td><td>Laudos-Mega</td></tr>
+          <tr><td><code>samba-administrativo</code></td><td>Administrativo</td></tr>
+        </tbody>
+      </table>
+
+      <pre><code>sync-nextcloud-state --dry-run
+jq '.counts' \
+  /var/lib/samba-nextcloud-sync/state/last-plan.json</code></pre>
+
+      <div class="notice ok">
+        Encerramento esperado: <code>new_users=0</code>,
+        <code>conflicts=0</code>, <code>memberships_add=0</code> e
+        <code>memberships_remove=0</code>.
+      </div>
+      <label class="check"><input type="checkbox"> Login validado.</label>
+      <label class="check"><input type="checkbox"> Storages e permissões validados.</label>
+      <label class="check"><input type="checkbox"> Dry-run final convergente.</label>
+      <label class="check"><input type="checkbox"> Evidência/ticket atualizado sem senhas.</label>
+    </section>
+
+    <section id="falhas">
+      <h2><span class="step">!</span>Se algo falhar</h2>
+      <div class="notice danger">
+        Não execute <code>user:delete</code>, não apague a pasta pessoal, não
+        remova journals e não edite o banco Nextcloud para “tentar novamente”.
+      </div>
+      <table>
+        <thead><tr><th>Sintoma</th><th>Ação segura</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Usuário ausente no JSON</td>
+            <td>Rever <code>id</code>, tdbsam, grupos e journal do exportador.</td>
+          </tr>
+          <tr>
+            <td>Conflito no dry-run</td>
+            <td>Parar. Verificar se já existe conta Nextcloud sem marker. Adoção é procedimento separado e exige snapshots.</td>
+          </tr>
+          <tr>
+            <td>Generation mudou</td>
+            <td>Executar novo dry-run e revisar novamente. Nunca reutilizar UUID antigo.</td>
+          </tr>
+          <tr>
+            <td>Conta desabilitada após apply</td>
+            <td>Comportamento esperado; concluir onboarding.</td>
+          </tr>
+          <tr>
+            <td>Storage não aparece</td>
+            <td>Rever membership, External Storage, CIFS, path e ACL. Não conceder grupos extras como atalho.</td>
+          </tr>
+          <tr>
+            <td>Apply parcial</td>
+            <td>Preservar o journal em <code>/var/lib/samba-nextcloud-sync/state/provisioning/</code> e executar novo dry-run antes de retomar.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>Para adoção, lifecycle, rename, purge ou restore, use
+        <code>nextcloud/OPERATIONS.md</code> e tire os snapshots obrigatórios
+        antes de qualquer ação destrutiva.</p>
+    </section>
+  </main>
+
+  <footer>
+    scripts_servidor — fluxo Samba → Nextcloud, sem sincronização de senhas.
+  </footer>
+</body>
+</html>
