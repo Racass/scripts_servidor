@@ -419,13 +419,13 @@ stat -c '%a %u:%g %n' \
 
       <h3>5.1 Congelar gravações</h3>
       <p>Na VM Nextcloud:</p>
-      <pre><code>      systemctl stop \
-        nextcloud-cron.timer \
-        nextcloud-files-scan.timer \
-        sync-nextcloud-state.timer
+      <pre><code>systemctl stop \
+  nextcloud-cron.timer \
+  nextcloud-files-scan.timer \
+  sync-nextcloud-state.timer
 
-      for service in \
-        nextcloud-cron.service \
+for service in \
+  nextcloud-cron.service \
   nextcloud-files-scan.service \
   sync-nextcloud-state.service
 do
@@ -446,7 +446,7 @@ systemctl stop export-nextcloud-state.timer</code></pre>
       <h3>5.2 Migrar somente o data directory técnico</h3>
       <div class="notice warn">
         Esta cópia não importa os shares Samba. Ela preserva o estado interno
-        da instalação Nextcloud atual, como <code>.ocdata</code>,
+        da instalação Nextcloud atual, como <code>.ncdata</code>,
         <code>appdata_*</code> e a consistência com o banco. Trocar por um
         diretório vazio sem reinstalar o Nextcloud não é suportado.
       </div>
@@ -498,10 +498,17 @@ for attempt in $(seq 1 60); do
   docker exec -u www-data nextcloud-app \
     php occ status --output=json &amp;&amp; break
   sleep 5
-done</code></pre>
+done
 
-      <p>Mantenha maintenance mode ligado. Ajuste os storages existentes por
-        nome, sem assumir IDs numéricos:</p>
+# O Nextcloud 34 não carrega comandos de apps em maintenance mode.
+# Feche os dois frontends antes de desativá-lo temporariamente.
+systemctl stop nginx cloudflared
+docker exec -u www-data nextcloud-app \
+  php occ maintenance:mode --off</code></pre>
+
+      <p>Com Nginx e cloudflared parados, ajuste os storages existentes por
+        nome, sem assumir IDs numéricos. Se houver falha, reative maintenance
+        mode e mantenha os frontends parados:</p>
       <pre><code>occ() {
   docker exec -u www-data nextcloud-app php occ "$@"
 }
@@ -554,12 +561,11 @@ occ files_external:list</code></pre>
       <pre><code>docker exec -u www-data nextcloud-app \
   php occ files:scan --all
 
-docker exec -u www-data nextcloud-app \
-  php occ maintenance:mode --off
-
-systemctl start \
+systemctl enable --now \
   nextcloud-cron.timer \
-  nextcloud-files-scan.timer</code></pre>
+  nextcloud-files-scan.timer
+systemctl disable --now sync-nextcloud-state.timer
+systemctl start nginx cloudflared</code></pre>
 
       <div class="notice warn">
         Não reative <code>sync-nextcloud-state.timer</code> enquanto Samba e o
