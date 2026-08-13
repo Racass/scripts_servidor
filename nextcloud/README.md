@@ -104,7 +104,7 @@ sftp -F /etc/samba-nextcloud-sync/ssh_config samba-state-source
 
 ## Sincronizacao em dry-run
 
-`sync-nextcloud-state` inicialmente aceita somente `--dry-run`. Ele:
+`sync-nextcloud-state --dry-run`:
 
 - baixa o snapshot por SFTP para staging root-only;
 - valida tamanho, schema, freshness, geração e circuit breakers;
@@ -115,6 +115,18 @@ sftp -F /etc/samba-nextcloud-sync/ssh_config samba-state-source
 - grava `last-plan.json` e, somente em execução saudável sem conflitos,
   promove `last-known-good.json`;
 - nunca cria, altera, habilita, desabilita ou apaga contas.
+
+Depois de revisar o plano, `--apply-additive` pode:
+
+- criar grupos gerenciados ausentes;
+- criar contas com senha aleatória não exibida;
+- desabilitar imediatamente cada conta nova;
+- gravar os markers `managed_by=samba-nextcloud-sync` e
+  `onboarding_pending=1`;
+- adicionar memberships ausentes.
+
+O modo aditivo não remove memberships, não habilita contas, não processa
+ausências e nunca apaga usuários ou arquivos.
 
 Instale:
 
@@ -137,6 +149,22 @@ Execute manualmente:
 ```bash
 sudo sync-nextcloud-state --dry-run
 ```
+
+O apply exige vinculação ao plano revisado:
+
+```bash
+sudo sync-nextcloud-state \
+  --apply-additive \
+  --reviewed-generation UUID_DO_DRY_RUN
+```
+
+Contas em criação passam temporariamente pelo grupo interno
+`samba-nextcloud-provisioning`. Isso permite que uma execução interrompida
+retome com segurança a desativação e os markers antes de adicionar os grupos
+Samba. Um display name imprevisível registrado no journal prova que a conta
+foi criada pelo sincronizador; o grupo sozinho nunca é usado como prova de
+ownership. Um journal root-only fica em
+`/var/lib/samba-nextcloud-sync/state/provisioning/` até a conclusão.
 
 Um username que já exista no Nextcloud sem o marker do sincronizador é
 tratado como conflito e nunca é adotado automaticamente.

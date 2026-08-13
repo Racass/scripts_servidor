@@ -1,4 +1,7 @@
 {
+  "mode": "dry-run",
+  "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "pending_provisioning": [],
   "source": {
     "schema_version": 1,
     "source": {
@@ -47,4 +50,3 @@
     "orphan": "samba-nextcloud-sync"
   }
 }
-

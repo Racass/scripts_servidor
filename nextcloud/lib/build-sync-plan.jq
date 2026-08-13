@@ -5,6 +5,9 @@ def managed_by_sync($markers; $user):
   ($markers[$user] // "") == "samba-nextcloud-sync";
 
 .source as $source
+| (.mode // "dry-run") as $mode
+| (.source_sha256 // "") as $source_sha256
+| (.pending_provisioning // []) as $pending_provisioning
 | .nextcloud_users as $nextcloud_users
 | .nextcloud_groups as $nextcloud_groups
 | .markers as $markers
@@ -53,7 +56,8 @@ def managed_by_sync($markers; $user):
       }
   ] as $memberships_remove
 | {
-    mode: "dry-run",
+    mode: $mode,
+    source_sha256: $source_sha256,
     generation_id: $source.generation_id,
     generated_at: $source.generated_at,
     missing_groups: $missing_groups,
@@ -61,6 +65,7 @@ def managed_by_sync($markers; $user):
     conflicting_users: $conflicting_users,
     managed_users: $managed_users,
     absent_managed_users: $absent_managed_users,
+    pending_provisioning: $pending_provisioning,
     memberships_add: $memberships_add,
     memberships_remove: $memberships_remove,
     counts: {
@@ -71,6 +76,7 @@ def managed_by_sync($markers; $user):
       new_users: ($new_users | length),
       conflicts: ($conflicting_users | length),
       absent_managed_users: ($absent_managed_users | length),
+      pending_provisioning: ($pending_provisioning | length),
       memberships_add: ($memberships_add | length),
       memberships_remove: ($memberships_remove | length)
     }

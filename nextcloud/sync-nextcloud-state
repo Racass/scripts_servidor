@@ -16,6 +16,7 @@ readonly EXIT_SSH_IDENTITY=51
 readonly EXIT_NEXTCLOUD=60
 readonly EXIT_OCC_DISCOVERY=61
 readonly EXIT_CONFLICT=62
+readonly EXIT_PARTIAL=63
 readonly EXIT_FILESYSTEM=70
 
 readonly CONFIG_DIR="/etc/samba-nextcloud-sync"
@@ -29,9 +30,11 @@ readonly VALIDATOR="/usr/local/lib/samba-nextcloud/validate-nextcloud-state.jq"
 readonly PLAN_BUILDER="/usr/local/lib/samba-nextcloud/build-sync-plan.jq"
 readonly LAST_GOOD="$LOCAL_STATE_DIR/last-known-good.json"
 readonly LAST_PLAN="$LOCAL_STATE_DIR/last-plan.json"
+readonly PROVISIONING_DIR="$LOCAL_STATE_DIR/provisioning"
 readonly MAX_STATE_BYTES=1048576
 readonly DOWNLOAD_FILE_BLOCK_LIMIT=4096
 readonly OCC_DISCOVERY_LIMIT=20000
+readonly PROVISIONING_GROUP="samba-nextcloud-provisioning"
 readonly -a PROTECTED_USERS=(
     "admin"
     "nextcloud_user"
@@ -47,7 +50,11 @@ EXPECTED_NEXTCLOUD_MAJOR=34
 
 WORK_DIR=""
 CANDIDATE=""
-PLAN_TEMP=""
+RUN_MODE=""
+REVIEWED_GENERATION=""
+CANDIDATE_HASH=""
+EFFECTIVE_MARKERS_FILE=""
+PENDING_USERS_FILE=""
 
 log() {
     local level="$1"
@@ -66,9 +73,6 @@ cleanup() {
     if [[ -n "$CANDIDATE" && -e "$CANDIDATE" ]]; then
         rm -f -- "$CANDIDATE"
     fi
-    if [[ -n "$PLAN_TEMP" && -e "$PLAN_TEMP" ]]; then
-        rm -f -- "$PLAN_TEMP"
-    fi
     if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
         rm -rf -- "$WORK_DIR"
     fi
@@ -77,20 +81,38 @@ trap cleanup EXIT
 
 usage() {
     cat >&2 <<'EOF'
-Uso: sync-nextcloud-state --dry-run [--config /caminho/arquivo.conf]
+Uso:
+  sync-nextcloud-state --dry-run [--config /caminho/arquivo.conf]
+  sync-nextcloud-state --apply-additive --reviewed-generation UUID \
+    [--config /caminho/arquivo.conf]
 
-Esta versao nunca aplica mutacoes no Nextcloud.
+O modo aditivo nunca remove memberships, habilita, apaga ou desabilita por
+ausencia. Contas novas sao criadas com senha aleatoria e desabilitadas.
 EOF
 }
 
 parse_arguments() {
-    local dry_run=0
+    local selected_modes=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run)
-                dry_run=1
+                RUN_MODE="dry-run"
+                selected_modes=$((selected_modes + 1))
                 shift
+                ;;
+            --apply-additive)
+                RUN_MODE="apply-additive"
+                selected_modes=$((selected_modes + 1))
+                shift
+                ;;
+            --reviewed-generation)
+                [[ $# -ge 2 ]] || {
+                    usage
+                    exit "$EXIT_CONFIG"
+                }
+                REVIEWED_GENERATION="$2"
+                shift 2
                 ;;
             --config)
                 [[ $# -ge 2 ]] || {
@@ -107,10 +129,19 @@ parse_arguments() {
         esac
     done
 
-    [[ "$dry_run" -eq 1 ]] || {
+    [[ "$selected_modes" -eq 1 ]] || {
         usage
         exit "$EXIT_CONFIG"
     }
+    if [[ "$RUN_MODE" == "apply-additive" ]]; then
+        [[ "$REVIEWED_GENERATION" =~ \
+            ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+            die "$EXIT_CONFIG" \
+                "--reviewed-generation e obrigatorio no modo apply"
+    elif [[ -n "$REVIEWED_GENERATION" ]]; then
+        die "$EXIT_CONFIG" \
+            "--reviewed-generation so pode ser usado com --apply-additive"
+    fi
 }
 
 validate_root_owned_file() {
@@ -154,8 +185,8 @@ load_configuration() {
 require_dependencies() {
     local command
     for command in \
-        cut date docker flock grep install jq mktemp mv rm sftp sha256sum \
-        sort stat sync
+        basename chmod cp cut date docker flock grep install jq mktemp mv \
+        rm sftp sha256sum sort stat sync openssl tr
     do
         command -v "$command" >/dev/null 2>&1 ||
             die "$EXIT_DEPENDENCY" "Dependencia ausente: $command"
@@ -187,6 +218,7 @@ prepare_runtime() {
     ensure_directory "$STATE_DIR" 700
     ensure_directory "$INCOMING_DIR" 700
     ensure_directory "$LOCAL_STATE_DIR" 700
+    ensure_directory "$PROVISIONING_DIR" 700
     ensure_directory "$LOCK_DIR" 700
 
     [[ ! -e "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] ||
@@ -268,6 +300,7 @@ check_generation_and_circuit_breakers() {
 
     candidate_id="$(jq -r '.generation_id' "$CANDIDATE")"
     candidate_hash="$(sha256sum "$CANDIDATE" | cut -d' ' -f1)"
+    CANDIDATE_HASH="$candidate_hash"
     candidate_epoch="$(date -u -d \
         "$(jq -r '.generated_at' "$CANDIDATE")" +%s)"
     candidate_count="$(jq -r '.counts.users' "$CANDIDATE")"
@@ -386,27 +419,427 @@ discover_nextcloud() {
 
 build_plan() {
     local input="$WORK_DIR/planner-input.json"
+    local pending_json="$WORK_DIR/pending-users.json"
 
+    jq -Rsc 'split("\n") | map(select(length > 0)) | sort | unique' \
+        <"$PENDING_USERS_FILE" >"$pending_json"
     jq -n \
         --slurpfile source "$CANDIDATE" \
         --slurpfile users "$NC_USERS_FILE" \
         --slurpfile groups "$NC_GROUPS_FILE" \
-        --slurpfile markers "$MARKERS_FILE" \
+        --slurpfile markers "$EFFECTIVE_MARKERS_FILE" \
+        --slurpfile pending "$pending_json" \
+        --arg mode "$RUN_MODE" \
+        --arg source_sha256 "$CANDIDATE_HASH" \
         '{
+          mode: $mode,
+          source_sha256: $source_sha256,
           source: $source[0],
           nextcloud_users: $users[0],
           nextcloud_groups: $groups[0],
-          markers: $markers[0]
+          markers: $markers[0],
+          pending_provisioning: $pending[0]
         }' >"$input"
 
     jq -f "$PLAN_BUILDER" "$input" >"$WORK_DIR/plan.json" ||
         die "$EXIT_OCC_DISCOVERY" "Nao foi possivel calcular o plano"
     jq -e '
       type == "object"
-      and .mode == "dry-run"
+      and (.mode == "dry-run" or .mode == "apply-additive")
+      and (.source_sha256 | test("^[0-9a-f]{64}$"))
       and (.counts | type == "object")
     ' "$WORK_DIR/plan.json" >/dev/null ||
         die "$EXIT_OCC_DISCOVERY" "Plano calculado invalido"
+}
+
+validate_reviewed_plan() {
+    local reviewed_mode reviewed_generation reviewed_hash reviewed_conflicts
+
+    validate_root_owned_file "$LAST_PLAN"
+    reviewed_mode="$(jq -r '.mode // ""' "$LAST_PLAN")"
+    reviewed_generation="$(jq -r '.generation_id // ""' "$LAST_PLAN")"
+    reviewed_hash="$(jq -r '.source_sha256 // ""' "$LAST_PLAN")"
+    reviewed_conflicts="$(jq -r '.counts.conflicts // -1' "$LAST_PLAN")"
+
+    [[ "$reviewed_mode" == "dry-run" ]] ||
+        die "$EXIT_CONFIG" "O ultimo plano nao e um dry-run revisavel"
+    [[ "$reviewed_generation" == "$REVIEWED_GENERATION" ]] ||
+        die "$EXIT_GENERATION" \
+            "Generation revisada nao corresponde ao ultimo dry-run"
+    [[ "$reviewed_generation" == \
+        "$(jq -r '.generation_id' "$CANDIDATE")" ]] ||
+        die "$EXIT_GENERATION" \
+            "O snapshot mudou desde o dry-run revisado"
+    [[ "$reviewed_hash" == "$CANDIDATE_HASH" ]] ||
+        die "$EXIT_GENERATION" \
+            "O conteudo do snapshot mudou desde o dry-run revisado"
+    [[ "$reviewed_conflicts" -eq 0 ]] ||
+        die "$EXIT_CONFLICT" "O plano revisado contem conflitos"
+}
+
+validate_provisioning_journal() {
+    local user="$1"
+    local journal="$PROVISIONING_DIR/$user.json"
+
+    validate_root_owned_file "$journal"
+    [[ "$(stat -c '%a' -- "$journal")" == "600" ]] ||
+        die "$EXIT_PARTIAL" "Journal deve ter modo 0600: $user"
+    jq -e \
+        --arg user "$user" \
+        '
+          type == "object"
+          and (keys | sort) == ([
+            "generation_id",
+            "pending_display",
+            "status",
+            "updated_at",
+            "user"
+          ] | sort)
+          and .user == $user
+          and (.status == "intent" or .status == "created")
+          and (.generation_id | test(
+            "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          ))
+          and (.pending_display | test(
+            "^samba-sync-pending-[0-9a-f]{32}$"
+          ))
+          and (.updated_at | test(
+            "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          ))
+        ' "$journal" >/dev/null ||
+        die "$EXIT_PARTIAL" "Journal de provisionamento invalido: $user"
+
+    JOURNAL_STATUS="$(jq -r '.status' "$journal")"
+    JOURNAL_PENDING_DISPLAY="$(jq -r '.pending_display' "$journal")"
+}
+
+prepare_effective_markers() {
+    local journal user info display marker temp
+
+    EFFECTIVE_MARKERS_FILE="$WORK_DIR/effective-markers.json"
+    PENDING_USERS_FILE="$WORK_DIR/pending-users"
+    cp -- "$MARKERS_FILE" "$EFFECTIVE_MARKERS_FILE"
+    : >"$PENDING_USERS_FILE"
+
+    shopt -s nullglob
+    for journal in "$PROVISIONING_DIR"/*.json; do
+        user="$(basename "$journal" .json)"
+        [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
+            die "$EXIT_PARTIAL" "Nome de journal invalido: $journal"
+        validate_provisioning_journal "$user"
+
+        if ! jq -e --arg user "$user" \
+            '.users | index($user) != null' "$CANDIDATE" >/dev/null
+        then
+            die "$EXIT_PARTIAL" \
+                "Usuario com journal nao existe mais na origem: $user"
+        fi
+
+        if ! jq -e --arg user "$user" \
+            'has($user)' "$NC_USERS_FILE" >/dev/null
+        then
+            if [[ "$JOURNAL_STATUS" == "intent" ]]; then
+                continue
+            fi
+            die "$EXIT_PARTIAL" \
+                "Journal criado sem conta Nextcloud correspondente: $user"
+        fi
+
+        info="$(occ user:info "$user" --output=json)" ||
+            die "$EXIT_PARTIAL" "Falha ao inspecionar conta pendente $user"
+        display="$(jq -r '.display_name' <<<"$info")"
+        marker="$(jq -r --arg user "$user" '.[$user] // ""' "$MARKERS_FILE")"
+        [[ "$display" == "$JOURNAL_PENDING_DISPLAY" ||
+            "$marker" == "samba-nextcloud-sync" ]] ||
+            die "$EXIT_PARTIAL" \
+                "Conta pendente sem prova de ownership: $user"
+
+        temp="$(mktemp --tmpdir="$WORK_DIR" '.markers.XXXXXX')"
+        jq --arg user "$user" \
+            '.[$user] = "samba-nextcloud-sync"' \
+            "$EFFECTIVE_MARKERS_FILE" >"$temp"
+        mv -fT -- "$temp" "$EFFECTIVE_MARKERS_FILE"
+        printf '%s\n' "$user" >>"$PENDING_USERS_FILE"
+    done
+    shopt -u nullglob
+
+    while IFS= read -r user; do
+        [[ -n "$user" ]] || continue
+        [[ -f "$PROVISIONING_DIR/$user.json" ]] ||
+            die "$EXIT_PARTIAL" \
+                "Membership de provisionamento sem journal: $user"
+    done < <(jq -r \
+        --arg group "$PROVISIONING_GROUP" \
+        '.[$group] // [] | .[]' "$NC_GROUPS_FILE")
+}
+
+validate_current_plan_subset() {
+    local current="$WORK_DIR/plan.json"
+    local user
+
+    jq -e -s '
+      .[0] as $current
+      | .[1] as $reviewed
+      | def subset_strings($left; $right):
+          all($left[]; . as $item | $right | index($item) != null);
+        def membership_keys($items):
+          [$items[] | "\(.user)\u0000\(.group)"];
+        subset_strings(
+          $current.missing_groups;
+          $reviewed.missing_groups
+        )
+        and subset_strings(
+          $current.new_users;
+          $reviewed.new_users
+        )
+        and subset_strings(
+          membership_keys($current.memberships_add);
+          membership_keys($reviewed.memberships_add)
+        )
+        and all(
+          $current.pending_provisioning[];
+          . as $user
+          | (
+              ($reviewed.new_users | index($user) != null)
+              or
+              ($reviewed.pending_provisioning | index($user) != null)
+            )
+        )
+    ' "$current" "$LAST_PLAN" >/dev/null ||
+        die "$EXIT_GENERATION" \
+            "O estado Nextcloud exige acoes aditivas nao revisadas"
+
+    while IFS= read -r user; do
+        [[ -n "$user" ]] || continue
+        validate_provisioning_journal "$user"
+        jq -e --arg user "$user" \
+            '(.new_users | index($user) != null)
+             or (.pending_provisioning | index($user) != null)' \
+            "$LAST_PLAN" >/dev/null ||
+            die "$EXIT_CONFLICT" \
+                "Conflito atual nao estava no fluxo revisado: $user"
+    done < <(jq -r '.conflicting_users[]' "$current")
+}
+
+ensure_group() {
+    local group="$1"
+
+    if jq -e --arg group "$group" \
+        'has($group)' "$NC_GROUPS_FILE" >/dev/null
+    then
+        return
+    fi
+
+    log "INFO" "Criando grupo Nextcloud: $group"
+    occ group:add --quiet "$group" >/dev/null ||
+        die "$EXIT_PARTIAL" "Falha ao criar grupo $group"
+}
+
+write_provisioning_journal() {
+    local user="$1"
+    local status="$2"
+    local pending_display="$3"
+    local journal="$PROVISIONING_DIR/$user.json"
+    local temp
+
+    temp="$(mktemp --tmpdir="$PROVISIONING_DIR" ".$user.XXXXXX")" ||
+        die "$EXIT_FILESYSTEM" \
+            "Nao foi possivel criar journal de provisionamento"
+    jq -n \
+        --arg user "$user" \
+        --arg status "$status" \
+        --arg pending_display "$pending_display" \
+        --arg generation_id "$(jq -r '.generation_id' "$CANDIDATE")" \
+        --arg updated_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+        '{
+          user: $user,
+          status: $status,
+          pending_display: $pending_display,
+          generation_id: $generation_id,
+          updated_at: $updated_at
+        }' >"$temp"
+    chmod 0600 "$temp"
+    sync -f "$temp" ||
+        die "$EXIT_FILESYSTEM" \
+            "Nao foi possivel sincronizar journal de $user"
+    mv -fT -- "$temp" "$journal" ||
+        die "$EXIT_FILESYSTEM" \
+            "Nao foi possivel publicar journal de $user"
+    sync -f "$PROVISIONING_DIR" ||
+        die "$EXIT_FILESYSTEM" \
+            "Nao foi possivel sincronizar diretorio de journals"
+}
+
+finalize_pending_user() {
+    local user="$1"
+    local info enabled display marker onboarding
+
+    validate_provisioning_journal "$user"
+    info="$(occ user:info "$user" --output=json)" ||
+        die "$EXIT_PARTIAL" "Falha ao inspecionar usuario pendente $user"
+    display="$(jq -r '.display_name' <<<"$info")"
+    marker="$(occ user:setting "$user" samba_nextcloud_sync managed_by \
+        --default-value='' 2>/dev/null)" ||
+        die "$EXIT_PARTIAL" "Falha ao consultar marker de $user"
+    [[ "$display" == "$JOURNAL_PENDING_DISPLAY" ||
+        "$marker" == "samba-nextcloud-sync" ]] ||
+        die "$EXIT_PARTIAL" \
+            "Conta pendente sem prova de ownership: $user"
+
+    log "INFO" "Finalizando provisionamento de $user"
+    occ user:disable --quiet "$user" >/dev/null ||
+        die "$EXIT_PARTIAL" "Falha ao desabilitar usuario novo $user"
+    occ user:setting --quiet \
+        "$user" samba_nextcloud_sync managed_by \
+        "samba-nextcloud-sync" >/dev/null ||
+        die "$EXIT_PARTIAL" "Falha ao marcar ownership de $user"
+    occ user:setting --quiet \
+        "$user" samba_nextcloud_sync onboarding_pending "1" >/dev/null ||
+        die "$EXIT_PARTIAL" "Falha ao marcar onboarding de $user"
+    occ user:profile --quiet "$user" displayname "$user" >/dev/null ||
+        die "$EXIT_PARTIAL" "Falha ao normalizar display name de $user"
+
+    info="$(occ user:info "$user" --output=json)" ||
+        die "$EXIT_PARTIAL" "Falha ao validar usuario novo $user"
+    enabled="$(jq -r '.enabled' <<<"$info")"
+    display="$(jq -r '.display_name' <<<"$info")"
+    marker="$(occ user:setting "$user" samba_nextcloud_sync managed_by \
+        --default-value='' 2>/dev/null)" ||
+        die "$EXIT_PARTIAL" "Falha ao validar marker de $user"
+    onboarding="$(occ user:setting \
+        "$user" samba_nextcloud_sync onboarding_pending \
+        --default-value='' 2>/dev/null)" ||
+        die "$EXIT_PARTIAL" "Falha ao validar onboarding de $user"
+    [[ "$enabled" == "false" &&
+        "$display" == "$user" &&
+        "$marker" == "samba-nextcloud-sync" &&
+        "$onboarding" == "1" ]] ||
+        die "$EXIT_PARTIAL" \
+            "Usuario $user nao ficou desabilitado e marcado corretamente"
+
+    if ! occ group:removeuser --quiet \
+        "$PROVISIONING_GROUP" "$user" >/dev/null 2>&1
+    then
+        occ group:list "$PROVISIONING_GROUP" --output=json |
+            jq -e --arg group "$PROVISIONING_GROUP" --arg user "$user" \
+                '(.[$group] // []) | index($user) == null' >/dev/null ||
+            die "$EXIT_PARTIAL" \
+                "Falha ao remover $user do grupo de provisionamento"
+    fi
+    rm -f -- "$PROVISIONING_DIR/$user.json"
+    sync -f "$PROVISIONING_DIR" ||
+        die "$EXIT_FILESYSTEM" \
+            "Nao foi possivel sincronizar journal removido"
+}
+
+create_disabled_user() {
+    local user="$1"
+    local password pending_display
+
+    pending_display="samba-sync-pending-$(openssl rand -hex 16)" ||
+        die "$EXIT_DEPENDENCY" \
+            "Nao foi possivel gerar identificador de provisionamento"
+    write_provisioning_journal "$user" "intent" "$pending_display"
+
+    password="$(openssl rand -base64 48 | tr -d '\n')" ||
+        die "$EXIT_DEPENDENCY" "Nao foi possivel gerar senha aleatoria"
+    [[ -n "$password" ]] ||
+        die "$EXIT_DEPENDENCY" "Senha aleatoria vazia"
+
+    log "INFO" "Criando conta Nextcloud desabilitada: $user"
+    if ! OC_PASS="$password" docker exec \
+        -e OC_PASS \
+        -u www-data \
+        "$CONTAINER" \
+        php occ --no-ansi --no-interaction \
+        user:add \
+        --password-from-env \
+        --group="$PROVISIONING_GROUP" \
+        --display-name="$pending_display" \
+        --quiet \
+        "$user" >/dev/null 2>&1
+    then
+        unset password
+        die "$EXIT_PARTIAL" "Falha ao criar usuario $user"
+    fi
+    unset password
+
+    write_provisioning_journal "$user" "created" "$pending_display"
+    finalize_pending_user "$user"
+}
+
+add_membership() {
+    local user="$1"
+    local group="$2"
+
+    log "INFO" "Adicionando membership user=$user group=$group"
+    occ group:adduser --quiet "$group" "$user" >/dev/null ||
+        die "$EXIT_PARTIAL" \
+            "Falha ao adicionar $user ao grupo $group"
+}
+
+apply_additive_plan() {
+    local group user
+
+    ensure_group "$PROVISIONING_GROUP"
+
+    while IFS= read -r group; do
+        [[ -n "$group" ]] || continue
+        ensure_group "$group"
+    done < <(jq -r '.missing_groups[]' "$WORK_DIR/plan.json")
+
+    while IFS= read -r user; do
+        [[ -n "$user" ]] || continue
+        create_disabled_user "$user"
+    done < <(jq -r '.new_users[]' "$WORK_DIR/plan.json")
+
+    while IFS=$'\t' read -r user group; do
+        [[ -n "$user" && -n "$group" ]] || continue
+        add_membership "$user" "$group"
+    done < <(jq -r \
+        '.memberships_add[] | [.user, .group] | @tsv' \
+        "$WORK_DIR/plan.json")
+}
+
+reconcile_pending_provisions() {
+    local journal user
+
+    shopt -s nullglob
+    for journal in "$PROVISIONING_DIR"/*.json; do
+        user="$(basename "$journal" .json)"
+        validate_provisioning_journal "$user"
+        if jq -e --arg user "$user" \
+            'has($user)' "$NC_USERS_FILE" >/dev/null
+        then
+            finalize_pending_user "$user"
+        elif [[ "$JOURNAL_STATUS" == "intent" ]]; then
+            rm -f -- "$journal"
+            sync -f "$PROVISIONING_DIR" ||
+                die "$EXIT_FILESYSTEM" \
+                    "Nao foi possivel remover journal stale"
+        else
+            die "$EXIT_PARTIAL" \
+                "Conta criada desapareceu durante provisionamento: $user"
+        fi
+    done
+    shopt -u nullglob
+}
+
+verify_additive_convergence() {
+    local remaining
+
+    discover_nextcloud
+    prepare_effective_markers
+    build_plan
+    remaining="$(jq '
+      .counts.missing_groups
+      + .counts.new_users
+      + .counts.conflicts
+      + .counts.memberships_add
+    ' "$WORK_DIR/plan.json")"
+    [[ "$remaining" -eq 0 ]] ||
+        die "$EXIT_PARTIAL" \
+            "Convergencia aditiva incompleta; restam $remaining acoes"
 }
 
 publish_local_state() {
@@ -430,7 +863,8 @@ report_plan() {
 
     generation="$(jq -r '.generation_id' "$WORK_DIR/plan.json")"
     counts="$(jq -c '.counts' "$WORK_DIR/plan.json")"
-    log "INFO" "Plano dry-run generation_id=$generation counts=$counts"
+    log "INFO" \
+        "Plano mode=$RUN_MODE generation_id=$generation counts=$counts"
     jq . "$WORK_DIR/plan.json"
 }
 
@@ -461,20 +895,44 @@ main() {
     fi
 
     discover_nextcloud
+    prepare_effective_markers
     build_plan
-    publish_local_state "last-plan.json" "$WORK_DIR/plan.json" 0600
 
-    report_plan
+    if [[ "$RUN_MODE" == "apply-additive" ]]; then
+        validate_reviewed_plan
+        validate_current_plan_subset
+        reconcile_pending_provisions
+        discover_nextcloud
+        prepare_effective_markers
+        build_plan
+        validate_current_plan_subset
+    fi
 
     conflicts="$(jq -r '.counts.conflicts' "$WORK_DIR/plan.json")"
     if [[ "$conflicts" -gt 0 ]]; then
+        if [[ "$RUN_MODE" == "dry-run" ]]; then
+            publish_local_state "last-plan.json" "$WORK_DIR/plan.json" 0600
+        fi
+        report_plan
         die "$EXIT_CONFLICT" \
             "$conflicts conta(s) Nextcloud preexistente(s) sem marker"
+    fi
+
+    if [[ "$RUN_MODE" == "apply-additive" ]]; then
+        publish_local_state \
+            "last-applied-plan.json" "$WORK_DIR/plan.json" 0600
+        apply_additive_plan
+        verify_additive_convergence
+        publish_local_state "last-plan.json" "$WORK_DIR/plan.json" 0600
+    else
+        publish_local_state "last-plan.json" "$WORK_DIR/plan.json" 0600
     fi
 
     if [[ "$SAME_GENERATION" -eq 0 ]]; then
         publish_local_state "last-known-good.json" "$CANDIDATE" 0600
     fi
+
+    report_plan
 }
 
 main "$@"
