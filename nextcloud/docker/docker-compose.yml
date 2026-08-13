@@ -22,7 +22,6 @@ services:
     volumes:
       - nc_html:/var/www/html
       - /srv/nextcloud-storage/app-data:/var/www/html/data
-      - /srv/nextcloud-storage/shares:/mnt/storage/shares
     environment:
       MYSQL_HOST: db
       MYSQL_DATABASE: nextcloud

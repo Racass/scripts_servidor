@@ -49,25 +49,19 @@ systemctl daemon-reload
 ```
 
 Isso impede o Docker de iniciar antes do mount
-`/srv/nextcloud-storage`. O Compose usa:
+`/srv/nextcloud-storage`. O Compose usa o data directory padrão:
 
 ```text
 /srv/nextcloud-storage/app-data -> /var/www/html/data
-/srv/nextcloud-storage/shares   -> /mnt/storage/shares
 ```
 
-Os shares são locais e começam vazios. O storage `Laudos-Mega` aponta para
-`/mnt/storage/shares/laudos/mega`, compartilhando o mesmo subdiretório físico
-visível em `Laudos`.
+Todos os arquivos normais exibidos pelo app **Arquivos/Files**, além de
+versões, lixeira, previews e metadados de arquivos, ficam nesse diretório do
+disco dedicado. Não há External Storages configurados.
 
 Enquanto o fileserver Samba estiver desligado, mantenha
 `sync-nextcloud-state.timer` desabilitado e administre usuários e grupos
 diretamente no Nextcloud.
-
-Após remover os grupos legados `samba-*`, mantenha os seis External Storages
-restritos ao grupo vazio `nextcloud-storage-disabled`. Substitua essa
-associação pelos novos grupos de acesso antes de remover o grupo de
-quarentena; um storage sem usuários ou grupos aplicáveis fica global.
 
 ## HTTPS privado
 
