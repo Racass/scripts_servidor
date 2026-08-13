@@ -1,0 +1,217 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+
+readonly SYNC_USER="nextcloud-sync"
+readonly NEXTCLOUD_IP="10.0.77.101"
+readonly CHROOT_DIR="/var/lib/samba-nextcloud-export"
+readonly AUTHORIZED_KEYS_DIR="/etc/ssh/authorized_keys"
+readonly AUTHORIZED_KEYS_FILE="$AUTHORIZED_KEYS_DIR/$SYNC_USER"
+readonly SSHD_DROPIN="/etc/ssh/sshd_config.d/60-nextcloud-sync.conf"
+
+PUBLIC_KEY_FILE=""
+TEMP_DROPIN=""
+SSHD_BACKUP=""
+
+log() {
+    local level="$1"
+    shift
+    printf '[%s] %s\n' "$level" "$*" >&2
+}
+
+die() {
+    log "ERROR" "$2"
+    exit "$1"
+}
+
+cleanup() {
+    if [[ -n "$TEMP_DROPIN" && -e "$TEMP_DROPIN" ]]; then
+        rm -f -- "$TEMP_DROPIN"
+    fi
+    if [[ -n "$SSHD_BACKUP" && -e "$SSHD_BACKUP" ]]; then
+        rm -f -- "$SSHD_BACKUP"
+    fi
+}
+trap cleanup EXIT
+
+usage() {
+    echo "Uso: configure-nextcloud-sync-sftp --public-key-file ARQUIVO" >&2
+}
+
+parse_arguments() {
+    if [[ $# -eq 2 && "$1" == "--public-key-file" ]]; then
+        PUBLIC_KEY_FILE="$2"
+        return
+    fi
+    usage
+    exit 10
+}
+
+require_dependencies() {
+    local command
+    for command in \
+        cat chown chmod cp cut getent grep id install mktemp mv passwd \
+        pdbedit rm ssh-keygen sshd stat systemctl useradd usermod
+    do
+        command -v "$command" >/dev/null 2>&1 ||
+            die 11 "Dependencia ausente: $command"
+    done
+}
+
+validate_public_key() {
+    local size lines key_type key_data extra
+
+    [[ -f "$PUBLIC_KEY_FILE" && ! -L "$PUBLIC_KEY_FILE" ]] ||
+        die 10 "Arquivo de chave publica invalido"
+    size="$(stat -c '%s' -- "$PUBLIC_KEY_FILE")"
+    [[ "$size" -gt 0 && "$size" -le 1024 ]] ||
+        die 10 "Tamanho inesperado da chave publica"
+    lines="$(grep -c '^' "$PUBLIC_KEY_FILE")"
+    [[ "$lines" -eq 1 ]] ||
+        die 10 "A chave publica deve conter exatamente uma linha"
+
+    read -r key_type key_data extra <"$PUBLIC_KEY_FILE"
+    [[ "$key_type" == "ssh-ed25519" && -n "$key_data" ]] ||
+        die 10 "Somente chave Ed25519 e aceita"
+    ssh-keygen -l -f "$PUBLIC_KEY_FILE" >/dev/null ||
+        die 10 "Chave publica malformada"
+
+    PUBLIC_KEY="$key_type $key_data"
+}
+
+ensure_account() {
+    local groups
+
+    if pdbedit -L | cut -d: -f1 | grep -Fxq "$SYNC_USER"; then
+        die 10 "A conta tecnica nao pode existir no tdbsam"
+    fi
+
+    if ! getent passwd "$SYNC_USER" >/dev/null; then
+        useradd \
+            --system \
+            --user-group \
+            --home-dir / \
+            --shell /usr/sbin/nologin \
+            "$SYNC_USER"
+    else
+        groups="$(id -nG "$SYNC_USER")"
+        [[ "$groups" == "$SYNC_USER" ]] ||
+            die 10 "A conta $SYNC_USER pertence a grupos adicionais: $groups"
+    fi
+
+    usermod --home / --shell /usr/sbin/nologin "$SYNC_USER"
+    passwd -l "$SYNC_USER" >/dev/null
+
+    groups="$(id -nG "$SYNC_USER")"
+    [[ "$groups" == "$SYNC_USER" ]] ||
+        die 10 "A conta $SYNC_USER pertence a grupos adicionais: $groups"
+}
+
+install_authorized_key() {
+    local temp_key
+
+    [[ ! -L "$AUTHORIZED_KEYS_DIR" ]] ||
+        die 10 "Diretorio de authorized_keys nao pode ser symlink"
+    install -d -o root -g root -m 0755 -- "$AUTHORIZED_KEYS_DIR"
+    temp_key="$(mktemp --tmpdir="$AUTHORIZED_KEYS_DIR" '.nextcloud-sync.XXXXXX')"
+    printf 'restrict,from="%s" %s\n' "$NEXTCLOUD_IP" "$PUBLIC_KEY" >"$temp_key"
+    chown root:root "$temp_key"
+    chmod 0644 "$temp_key"
+    mv -fT -- "$temp_key" "$AUTHORIZED_KEYS_FILE"
+}
+
+install_sshd_dropin() {
+    [[ ! -L "$SSHD_DROPIN" ]] ||
+        die 10 "Drop-in SSH nao pode ser symlink"
+    TEMP_DROPIN="$(mktemp --tmpdir=/etc/ssh/sshd_config.d \
+        '.60-nextcloud-sync.conf.XXXXXX')"
+    cat >"$TEMP_DROPIN" <<'EOF'
+Match User nextcloud-sync
+    AuthenticationMethods publickey
+    PubkeyAuthentication yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+    ChrootDirectory /var/lib/samba-nextcloud-export
+    ForceCommand internal-sftp -R -d /
+    DisableForwarding yes
+    PermitTTY no
+    PermitUserEnvironment no
+    X11Forwarding no
+EOF
+
+    if [[ -e "$SSHD_DROPIN" ]]; then
+        SSHD_BACKUP="$(mktemp -p /etc/ssh '.60-nextcloud-sync.backup.XXXXXX')"
+        cp -a -- "$SSHD_DROPIN" "$SSHD_BACKUP"
+    fi
+    install -o root -g root -m 0644 "$TEMP_DROPIN" "$SSHD_DROPIN"
+    rm -f -- "$TEMP_DROPIN"
+    TEMP_DROPIN=""
+
+    if ! sshd -t; then
+        if [[ -n "$SSHD_BACKUP" ]]; then
+            cp -a -- "$SSHD_BACKUP" "$SSHD_DROPIN"
+        else
+            rm -f -- "$SSHD_DROPIN"
+        fi
+        die 10 "A validacao do sshd falhou; configuracao restaurada"
+    fi
+    if ! validate_effective_configuration; then
+        if [[ -n "$SSHD_BACKUP" ]]; then
+            cp -a -- "$SSHD_BACKUP" "$SSHD_DROPIN"
+        else
+            rm -f -- "$SSHD_DROPIN"
+        fi
+        sshd -t ||
+            die 10 "Rollback do sshd resultou em configuracao invalida"
+        die 10 "Restricoes SSH efetivas inesperadas; configuracao restaurada"
+    fi
+    if ! systemctl reload ssh; then
+        if [[ -n "$SSHD_BACKUP" ]]; then
+            cp -a -- "$SSHD_BACKUP" "$SSHD_DROPIN"
+        else
+            rm -f -- "$SSHD_DROPIN"
+        fi
+        sshd -t && systemctl reload ssh
+        die 10 "Nao foi possivel recarregar o sshd; configuracao restaurada"
+    fi
+    if [[ -n "$SSHD_BACKUP" ]]; then
+        rm -f -- "$SSHD_BACKUP"
+        SSHD_BACKUP=""
+    fi
+}
+
+validate_effective_configuration() {
+    local effective
+
+    effective="$(sshd -T \
+        -C "user=$SYNC_USER,host=fileserver.corp,addr=$NEXTCLOUD_IP")"
+
+    grep -Fxq 'authenticationmethods publickey' <<<"$effective"
+    grep -Fxq 'passwordauthentication no' <<<"$effective"
+    grep -Fxq 'kbdinteractiveauthentication no' <<<"$effective"
+    grep -Fxq 'chrootdirectory /var/lib/samba-nextcloud-export' <<<"$effective"
+    grep -Fxq 'forcecommand internal-sftp -R -d /' <<<"$effective"
+    grep -Fxq 'disableforwarding yes' <<<"$effective"
+}
+
+main() {
+    parse_arguments "$@"
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] ||
+        die 12 "Execute como root"
+
+    require_dependencies
+    validate_public_key
+    ensure_account
+    [[ ! -L "$CHROOT_DIR" ]] ||
+        die 10 "Chroot nao pode ser symlink"
+    install -d -o root -g root -m 0755 -- "$CHROOT_DIR"
+    install_authorized_key
+    install_sshd_dropin
+
+    log "INFO" "SFTP read-only configurado para $SYNC_USER"
+}
+
+main "$@"

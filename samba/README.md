@@ -20,6 +20,22 @@ devem estar disponiveis.
 Antes da primeira execucao, a conta/grupo de transporte `nextcloud-sync`
 precisa existir. A configuracao de SFTP e feita em uma fase separada.
 
+O configurador `configure-nextcloud-sync-sftp` cria essa conta sem Samba,
+senha, sudo ou shell e aplica:
+
+- chroot em `/var/lib/samba-nextcloud-export`;
+- `internal-sftp -R`;
+- autenticacao somente por chave;
+- chave limitada ao IP `10.0.77.101`;
+- forwarding, TTY e ambiente desabilitados.
+
+Use a chave publica gerada no host Nextcloud:
+
+```bash
+configure-nextcloud-sync-sftp \
+  --public-key-file /root/nextcloud-sync.pub
+```
+
 ```bash
 install -D -o root -g root -m 0755 \
   samba/export-nextcloud-state \

@@ -70,3 +70,34 @@ originRequest:
 ```
 
 Não é necessário migrar esse túnel para gerenciamento pelo dashboard.
+
+## Transporte do estado Samba
+
+O script `configure-samba-state-client` prepara:
+
+- chave Ed25519 dedicada, root-only;
+- `known_hosts` dedicado e pinado;
+- cliente SSH sem senha e com `StrictHostKeyChecking=yes`;
+- diretórios de staging e estado fora do container.
+
+Primeiro gere a chave:
+
+```bash
+sudo bash nextcloud/configure-samba-state-client
+```
+
+Copie somente o arquivo público
+`/etc/samba-nextcloud-sync/id_ed25519.pub` para o fileserver. Depois obtenha
+`/etc/ssh/ssh_host_ed25519_key.pub` do fileserver por um canal administrativo
+confiável e conclua:
+
+```bash
+sudo bash nextcloud/configure-samba-state-client \
+  --host-key-file /root/fileserver-ed25519.pub
+```
+
+O consumidor deve usar:
+
+```bash
+sftp -F /etc/samba-nextcloud-sync/ssh_config samba-state-source
+```

@@ -1,0 +1,169 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+
+readonly CONFIG_DIR="/etc/samba-nextcloud-sync"
+readonly STATE_DIR="/var/lib/samba-nextcloud-sync"
+readonly KEY_FILE="$CONFIG_DIR/id_ed25519"
+readonly KNOWN_HOSTS_FILE="$CONFIG_DIR/known_hosts"
+readonly SSH_CONFIG_FILE="$CONFIG_DIR/ssh_config"
+readonly FILESERVER_IP="10.0.77.100"
+
+HOST_KEY_FILE=""
+
+log() {
+    local level="$1"
+    shift
+    printf '[%s] %s\n' "$level" "$*" >&2
+}
+
+die() {
+    log "ERROR" "$2"
+    exit "$1"
+}
+
+usage() {
+    echo "Uso: configure-samba-state-client [--host-key-file ARQUIVO]" >&2
+}
+
+parse_arguments() {
+    if [[ $# -eq 0 ]]; then
+        return
+    fi
+    if [[ $# -eq 2 && "$1" == "--host-key-file" ]]; then
+        HOST_KEY_FILE="$2"
+        return
+    fi
+    usage
+    exit 10
+}
+
+require_dependencies() {
+    local command
+    for command in chown chmod grep id install mktemp mv rm ssh-keygen stat
+    do
+        command -v "$command" >/dev/null 2>&1 ||
+            die 11 "Dependencia ausente: $command"
+    done
+}
+
+ensure_key() {
+    local public_temp
+
+    if [[ ! -e "$KEY_FILE" ]]; then
+        ssh-keygen \
+            -q \
+            -t ed25519 \
+            -N '' \
+            -C 'nextcloud-sync@nextcloud.corp' \
+            -f "$KEY_FILE"
+    fi
+
+    [[ -f "$KEY_FILE" && ! -L "$KEY_FILE" ]] ||
+        die 10 "Chave privada invalida"
+    [[ "$(stat -c '%u:%g:%a' -- "$KEY_FILE")" == "0:0:600" ]] ||
+        die 10 "Chave privada deve ser root:root 0600"
+    ssh-keygen -y -f "$KEY_FILE" >/dev/null ||
+        die 10 "Chave privada nao pode ser lida"
+
+    public_temp="$(mktemp --tmpdir="$CONFIG_DIR" '.id-ed25519-pub.XXXXXX')"
+    printf '%s %s\n' \
+        "$(ssh-keygen -y -f "$KEY_FILE")" \
+        "nextcloud-sync@nextcloud.corp" >"$public_temp"
+    chown root:root "$public_temp"
+    chmod 0644 "$public_temp"
+    mv -fT -- "$public_temp" "$KEY_FILE.pub"
+}
+
+install_host_key() {
+    local size lines key_type key_data extra temp
+
+    [[ -f "$HOST_KEY_FILE" && ! -L "$HOST_KEY_FILE" ]] ||
+        die 10 "Arquivo de host key invalido"
+    size="$(stat -c '%s' -- "$HOST_KEY_FILE")"
+    [[ "$size" -gt 0 && "$size" -le 1024 ]] ||
+        die 10 "Tamanho inesperado da host key"
+    lines="$(grep -c '^' "$HOST_KEY_FILE")"
+    [[ "$lines" -eq 1 ]] ||
+        die 10 "A host key deve conter exatamente uma linha"
+
+    read -r key_type key_data extra <"$HOST_KEY_FILE"
+    [[ "$key_type" == "ssh-ed25519" && -n "$key_data" ]] ||
+        die 10 "Somente host key Ed25519 e aceita"
+    ssh-keygen -l -f "$HOST_KEY_FILE" >/dev/null ||
+        die 10 "Host key malformada"
+
+    temp="$(mktemp --tmpdir="$CONFIG_DIR" '.known-hosts.XXXXXX')"
+    printf '%s %s %s\n' "$FILESERVER_IP" "$key_type" "$key_data" >"$temp"
+    chown root:root "$temp"
+    chmod 0644 "$temp"
+    mv -fT -- "$temp" "$KNOWN_HOSTS_FILE"
+}
+
+install_ssh_config() {
+    local temp
+
+    temp="$(mktemp --tmpdir="$CONFIG_DIR" '.ssh-config.XXXXXX')"
+    cat >"$temp" <<EOF
+Host samba-state-source
+    HostName $FILESERVER_IP
+    Port 22
+    User nextcloud-sync
+    IdentityFile $KEY_FILE
+    IdentitiesOnly yes
+    UserKnownHostsFile $KNOWN_HOSTS_FILE
+    GlobalKnownHostsFile /dev/null
+    StrictHostKeyChecking yes
+    UpdateHostKeys no
+    HostKeyAlgorithms ssh-ed25519
+    BatchMode yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    ConnectTimeout 10
+    ConnectionAttempts 2
+    RequestTTY no
+EOF
+    chown root:root "$temp"
+    chmod 0600 "$temp"
+    mv -fT -- "$temp" "$SSH_CONFIG_FILE"
+}
+
+ensure_safe_directory() {
+    local path="$1"
+    local mode="$2"
+
+    [[ ! -L "$path" ]] || die 10 "Diretorio nao pode ser symlink: $path"
+    if [[ ! -e "$path" ]]; then
+        install -d -o root -g root -m "$mode" -- "$path"
+    fi
+    [[ "$(stat -c '%F:%u:%g:%a' -- "$path")" == \
+        "directory:0:0:$mode" ]] ||
+        die 10 "Diretorio deve ser root:root modo $mode: $path"
+}
+
+main() {
+    parse_arguments "$@"
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] ||
+        die 12 "Execute como root"
+
+    require_dependencies
+    ensure_safe_directory "$CONFIG_DIR" 700
+    ensure_safe_directory "$STATE_DIR" 700
+    ensure_safe_directory "$STATE_DIR/incoming" 700
+    ensure_safe_directory "$STATE_DIR/state" 700
+    ensure_key
+    install_ssh_config
+
+    if [[ -n "$HOST_KEY_FILE" ]]; then
+        install_host_key
+        log "INFO" "Host key do fileserver instalada"
+    else
+        log "INFO" "Chave criada; falta instalar a host key do fileserver"
+    fi
+
+    log "INFO" "Chave publica: $KEY_FILE.pub"
+}
+
+main "$@"
