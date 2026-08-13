@@ -245,7 +245,9 @@ wait_container_jobs() {
     local processes
 
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-        if ! processes="$(docker top nextcloud-app -eo args 2>/dev/null)"; then
+        if ! processes="$(
+            docker top nextcloud-app -eo pid,args 2>/dev/null
+        )"; then
             log "ERROR" "Nao foi possivel inspecionar processos do Nextcloud"
             return 2
         fi
