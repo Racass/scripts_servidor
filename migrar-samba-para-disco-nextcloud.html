@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Disco dedicado para Nextcloud no Proxmox — passo a passo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #5e6879;
+      --paper: #fff;
+      --page: #f2f5fa;
+      --line: #d9e0eb;
+      --blue: #0969da;
+      --green: #18794e;
+      --amber: #9a6700;
+      --red: #cf222e;
+      --purple: #6639ba;
+      --code: #111827;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--page);
+      font: 16px/1.58 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    header {
+      padding: 44px 22px;
+      color: white;
+      background: linear-gradient(135deg, #102a43, #0969da 62%, #6639ba);
+    }
+    header div, main { max-width: 1040px; margin: auto; }
+    main, nav, section { min-width: 0; }
+    h1 { margin: 0 0 10px; font-size: clamp(29px, 5vw, 48px); line-height: 1.12; }
+    h2 { margin: 0 0 12px; line-height: 1.25; }
+    h3 { margin: 24px 0 8px; }
+    header p { max-width: 820px; margin: 0; opacity: .94; }
+    main { padding: 28px 18px 70px; }
+    nav, section {
+      margin: 18px 0;
+      padding: 25px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--paper);
+      box-shadow: 0 5px 18px rgba(23, 32, 51, .05);
+    }
+    nav { padding: 17px 22px; }
+    nav a { display: inline-block; margin: 4px 16px 4px 0; color: var(--blue); }
+    .step {
+      display: inline-grid;
+      place-items: center;
+      width: 35px;
+      height: 35px;
+      margin-right: 8px;
+      border-radius: 50%;
+      color: white;
+      background: var(--blue);
+      font-weight: 800;
+    }
+    .notice {
+      margin: 15px 0;
+      padding: 14px 16px;
+      border-left: 5px solid;
+      border-radius: 8px;
+    }
+    .info { background: #eef6ff; border-color: var(--blue); }
+    .ok { background: #edf9f2; border-color: var(--green); }
+    .warn { background: #fff8df; border-color: var(--amber); }
+    .danger { background: #fff0f0; border-color: var(--red); }
+    .design { background: #f4efff; border-color: var(--purple); }
+    pre {
+      max-width: 100%;
+      overflow-x: auto;
+      padding: 17px;
+      border-radius: 9px;
+      color: #e6edf7;
+      background: var(--code);
+      font: 14px/1.48 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    table { width: 100%; margin: 15px 0; border-collapse: collapse; }
+    th, td { padding: 10px; border: 1px solid var(--line); text-align: left; }
+    th { background: #f7f9fc; }
+    .check {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      margin: 9px 0;
+    }
+    .check input { width: 20px; height: 20px; margin-top: 2px; }
+    .diagram {
+      max-width: 100%;
+      white-space: pre;
+      overflow-x: auto;
+      padding: 17px;
+      border: 1px dashed #91a0b5;
+      border-radius: 9px;
+      background: #f8fafc;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    .fields {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+    }
+    .field {
+      min-height: 72px;
+      padding: 10px;
+      border: 1px dashed #9ba8ba;
+      border-radius: 8px;
+    }
+    .field strong { display: block; margin-bottom: 20px; }
+    footer { padding: 0 20px 40px; color: var(--muted); text-align: center; }
+    @media (max-width: 600px) {
+      main { padding-right: 10px; padding-left: 10px; }
+      nav, section { padding: 17px; }
+      table {
+        display: block;
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+    }
+    @media print {
+      body { background: white; font-size: 12px; }
+      header { padding: 20px; }
+      nav { display: none; }
+      section { box-shadow: none; break-inside: avoid; }
+      pre { white-space: pre-wrap; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Disco dedicado para o Nextcloud no Proxmox</h1>
+      <p>Criação do zero, shares locais vazios, migração técnica do volume
+        interno, mudança dos mounts Docker e desligamento reversível do
+        fileserver.</p>
+    </div>
+  </header>
+
+  <main>
+    <nav aria-label="Etapas">
+      <strong>Etapas:</strong>
+      <a href="#arquitetura">Arquitetura</a>
+      <a href="#preparar">Preparar</a>
+      <a href="#proxmox">Proxmox</a>
+      <a href="#filesystem">Filesystem</a>
+      <a href="#copiar">Storage vazio</a>
+      <a href="#cutover">Cutover</a>
+      <a href="#validar">Validar</a>
+      <a href="#operar">Operar</a>
+      <a href="#rollback">Rollback</a>
+    </nav>
+
+    <section id="arquitetura">
+      <h2><span class="step">0</span>Arquitetura recomendada</h2>
+      <div class="diagram">HD/Storage físico no Proxmox
+        │
+        └── disco virtual SCSI exclusivo
+              │
+              ▼
+        VM Nextcloud
+        /dev/sdX1 (ext4)
+        /srv/nextcloud-storage
+              ├── app-data/
+              └── shares/
+                    ├── publico/
+                    ├── usuarios/
+                    ├── laudos/
+                    │     └── mega/
+                    └── administrativo/
+              │
+              ▼ bind mounts
+        container nextcloud-app</div>
+
+      <div class="notice danger">
+        <strong>Nunca anexe o mesmo ext4 simultaneamente à VM Nextcloud e à
+        VM fileserver.</strong> Um filesystem comum não é cluster-aware;
+        multiattach pode causar corrupção silenciosa. Enquanto o disco estiver
+        na VM Nextcloud, o Samba de outra VM não poderá usar esse caminho
+        diretamente.
+      </div>
+
+      <div class="notice design">
+        Este guia não transforma o novo disco em share Samba e não copia os
+        arquivos dos shares antigos. Ele cria armazenamento local vazio para
+        o Nextcloud e deixa a VM fileserver preservada para rollback. Se Samba
+        voltar no futuro, será necessário decidir quem será novamente a fonte
+        de verdade.
+      </div>
+
+      <p>Os paths novos usados neste procedimento são:</p>
+      <table>
+        <thead><tr><th>Uso</th><th>Path no host Nextcloud</th><th>Path no container</th></tr></thead>
+        <tbody>
+          <tr><td>Dados internos Nextcloud</td><td><code>/srv/nextcloud-storage/app-data</code></td><td><code>/var/www/html/data</code></td></tr>
+          <tr><td>Shares locais novos e vazios</td><td><code>/srv/nextcloud-storage/shares</code></td><td><code>/mnt/storage/shares</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="preparar">
+      <h2><span class="step">1</span>Preparar e salvar tudo</h2>
+      <div class="fields">
+        <div class="field"><strong>Tamanho atual dos dados</strong></div>
+        <div class="field"><strong>Tamanho do novo disco</strong></div>
+        <div class="field"><strong>Storage Proxmox escolhido</strong></div>
+        <div class="field"><strong>Janela de manutenção</strong></div>
+      </div>
+
+      <h3>1.1 Levantar uso atual</h3>
+      <p>Na VM Nextcloud:</p>
+      <pre><code>df -hT
+du -sh /mnt/nextcloud-data/* 2&gt;/dev/null
+docker volume inspect docker_nc_data \
+  --format '{{.Mountpoint}}'
+docker system df</code></pre>
+
+      <p>Escolha um disco com folga para crescimento. Não use exatamente o
+        tamanho atual.</p>
+
+      <h3>1.2 Snapshots obrigatórios</h3>
+      <div class="notice danger">
+        Antes de particionar, migrar o volume interno ou recriar containers,
+        faça snapshots da
+        VM fileserver, VM Nextcloud e CT cloudflared. Confirme no Proxmox que
+        terminaram. Marque o novo disco como incluído em backup.
+      </div>
+      <label class="check"><input type="checkbox"> Snapshot da VM fileserver concluído.</label>
+      <label class="check"><input type="checkbox"> Snapshot da VM Nextcloud concluído.</label>
+      <label class="check"><input type="checkbox"> Snapshot do CT cloudflared concluído.</label>
+
+      <h3>1.3 Backup lógico do banco</h3>
+      <p>Na VM Nextcloud:</p>
+      <pre><code>install -d -o root -g root -m 0700 /root/backup-nextcloud
+DB_BACKUP="/root/backup-nextcloud/all-databases-$(date -u +%Y%m%dT%H%M%SZ).sql"
+
+docker exec docker-db-1 sh -c '
+  tmp=/tmp/backup-client.cnf
+  trap "rm -f $tmp" EXIT
+  umask 077
+  printf "[client]\nuser=root\npassword=%s\n" \
+    "$MYSQL_ROOT_PASSWORD" &gt;"$tmp"
+  mariadb-dump \
+    --defaults-extra-file="$tmp" \
+    --single-transaction \
+    --routines --triggers --events \
+    --all-databases
+' &gt;"$DB_BACKUP"
+
+chmod 0600 "$DB_BACKUP"
+test -s "$DB_BACKUP"</code></pre>
+
+      <h3>1.4 Consequências de desligar o Samba</h3>
+      <ul>
+        <li>o Samba deixa de ser a fonte ativa de usuários e grupos;</li>
+        <li>o exportador e o sync Samba → Nextcloud devem ser desabilitados;</li>
+        <li>novos usuários deverão ser administrados diretamente no Nextcloud;</li>
+        <li>ACLs Samba não serão copiadas como autorização; os grupos
+          Nextcloud controlarão os External Storages;</li>
+        <li>não execute lifecycle enquanto o fileserver estiver desligado.</li>
+      </ul>
+
+      <div class="notice info">
+        Se também não quiser preservar arquivos pessoais já enviados
+        diretamente ao Nextcloud, exclua-os pela interface do próprio
+        Nextcloud e esvazie a lixeira antes da janela. Não omita seletivamente
+        pastas do volume <code>docker_nc_data</code>: esse volume deve ser
+        migrado integralmente para permanecer consistente com o banco.
+      </div>
+    </section>
+
+    <section id="proxmox">
+      <h2><span class="step">2</span>Adicionar o disco virtual no Proxmox</h2>
+      <ol>
+        <li>Abra a VM Nextcloud no Proxmox.</li>
+        <li>Entre em <strong>Hardware → Add → Hard Disk</strong>.</li>
+        <li>Use barramento <strong>SCSI</strong>.</li>
+        <li>Escolha o storage físico desejado e informe o tamanho.</li>
+        <li>Marque <strong>Backup</strong>.</li>
+        <li>Habilite <strong>Discard</strong> se o storage suportar.</li>
+        <li>Use <strong>SSD emulation</strong> somente se o backend for SSD.</li>
+        <li>Confirme a adição. Não use compartilhamento/multiattach.</li>
+      </ol>
+
+      <div class="notice info">
+        O recomendado é criar um disco virtual no storage do Proxmox, não
+        passar uma partição física diretamente. Isso preserva snapshots,
+        backup, mobilidade e controle pelo hypervisor.
+      </div>
+
+      <p>Na VM Nextcloud, identifique o disco novo pelo tamanho:</p>
+      <pre><code>lsblk -e7 -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS,MODEL
+sudo fdisk -l</code></pre>
+
+      <div class="notice danger">
+        Nos exemplos seguintes usamos <code>/dev/sdb</code>. Substitua pelo
+        disco realmente novo. Escolher o disco errado destrói dados.
+      </div>
+      <label class="check"><input type="checkbox"> O disco escolhido está vazio e tem o tamanho esperado.</label>
+      <label class="check"><input type="checkbox"> O disco não é o disco do sistema.</label>
+    </section>
+
+    <section id="filesystem">
+      <h2><span class="step">3</span>Criar filesystem e mount permanente</h2>
+      <p>Instale as ferramentas e faça uma inspeção sem modificar:</p>
+      <pre><code>apt-get update
+apt-get install -y parted e2fsprogs rsync jq
+
+DISCO="/dev/sdb"
+wipefs -n "$DISCO"
+lsblk "$DISCO"</code></pre>
+
+      <div class="notice danger">
+        O bloco abaixo é destrutivo para <code>$DISCO</code>. Execute somente
+        depois de confirmar duas vezes o device.
+      </div>
+
+      <pre><code>read -r -p "Digite APAGAR-$DISCO para continuar: " CONFIRMA
+[[ "$CONFIRMA" == "APAGAR-$DISCO" ]] || exit 1
+
+parted -s "$DISCO" mklabel gpt
+parted -s "$DISCO" mkpart primary ext4 1MiB 100%
+udevadm settle
+
+PARTICAO="${DISCO}1"
+mkfs.ext4 -L NC_STORAGE "$PARTICAO"</code></pre>
+
+      <p>Descubra o UUID e monte em um path totalmente novo:</p>
+      <pre><code>UUID_NC="$(blkid -s UUID -o value "$PARTICAO")"
+test -n "$UUID_NC"
+
+install -d -o root -g root -m 0750 /srv/nextcloud-storage
+! grep -Fq ' /srv/nextcloud-storage ' /etc/fstab
+printf 'UUID=%s /srv/nextcloud-storage ext4 defaults,noatime 0 2\n' \
+  "$UUID_NC" &gt;&gt;/etc/fstab
+
+systemctl daemon-reload
+mount /srv/nextcloud-storage
+findmnt --verify
+findmnt /srv/nextcloud-storage</code></pre>
+
+      <div class="notice warn">
+        Não use <code>nofail</code>. Se o disco não montar, o boot/Docker deve
+        falhar fechado; caso contrário, dados podem ser gravados por engano
+        no disco raiz sob o diretório vazio.
+      </div>
+
+      <p>Crie a estrutura nova:</p>
+      <pre><code>install -d -o 33 -g 33 -m 0770 \
+  /srv/nextcloud-storage/app-data
+install -d -o 33 -g 33 -m 0750 \
+  /srv/nextcloud-storage/shares
+
+for dir in publico usuarios laudos administrativo; do
+  install -d -o 33 -g 33 -m 0770 \
+    "/srv/nextcloud-storage/shares/$dir"
+done
+install -d -o 33 -g 33 -m 0770 \
+  /srv/nextcloud-storage/shares/laudos/mega
+
+docker exec nextcloud-app id www-data
+stat -c '%a %u:%g %n' /srv/nextcloud-storage \
+  /srv/nextcloud-storage/app-data \
+  /srv/nextcloud-storage/shares/*</code></pre>
+
+      <h3>3.1 Fazer o Docker depender do mount</h3>
+      <pre><code>install -d -o root -g root -m 0755 \
+  /etc/systemd/system/docker.service.d
+
+cat &gt;/etc/systemd/system/docker.service.d/nextcloud-storage.conf &lt;&lt;'EOF'
+[Unit]
+RequiresMountsFor=/srv/nextcloud-storage
+EOF
+
+chmod 0644 \
+  /etc/systemd/system/docker.service.d/nextcloud-storage.conf
+systemctl daemon-reload</code></pre>
+    </section>
+
+    <section id="copiar">
+      <h2><span class="step">4</span>Preparar os shares vazios</h2>
+      <div class="notice design">
+        Nenhum arquivo dos shares Samba será copiado. Os dados antigos
+        permanecem intactos no fileserver desligado para eventual consulta ou
+        rollback manual.
+      </div>
+
+      <p>Confirme que os destinos estão vazios antes do cutover:</p>
+      <pre><code>find /srv/nextcloud-storage/shares -mindepth 1 \
+  -type f -print -quit
+
+test -z "$(
+  find /srv/nextcloud-storage/shares -mindepth 1 \
+    -type f -print -quit
+)"
+
+stat -c '%a %u:%g %n' \
+  /srv/nextcloud-storage/shares \
+  /srv/nextcloud-storage/shares/* \
+  /srv/nextcloud-storage/shares/laudos/mega</code></pre>
+
+      <p>O primeiro comando não deve listar arquivo algum. A árvore
+        <code>laudos/mega</code> é intencional: Laudos-Mega é uma visão do
+        subdiretório físico de Laudos, não uma segunda cópia.</p>
+    </section>
+
+    <section id="cutover">
+      <h2><span class="step">5</span>Cutover e desligamento do Samba</h2>
+      <div class="notice danger">
+        Esta etapa muda a origem dos dados e recria o container Nextcloud.
+        Comece somente dentro da janela, com snapshots concluídos.
+      </div>
+
+      <h3>5.1 Congelar gravações</h3>
+      <p>Na VM Nextcloud:</p>
+      <pre><code>      systemctl stop \
+        nextcloud-cron.timer \
+        nextcloud-files-scan.timer \
+        sync-nextcloud-state.timer
+
+      for service in \
+        nextcloud-cron.service \
+  nextcloud-files-scan.service \
+  sync-nextcloud-state.service
+do
+  systemctl is-active --quiet "$service" &amp;&amp; {
+    echo "Aguarde o service terminar: $service" &gt;&amp;2
+    exit 1
+  }
+done
+
+docker exec -u www-data nextcloud-app \
+  php occ maintenance:mode --on</code></pre>
+
+      <p>No fileserver, pare apenas a geração de novos snapshots. Não é
+        necessário congelar ou copiar os shares antigos:</p>
+      <pre><code>smbstatus
+systemctl stop export-nextcloud-state.timer</code></pre>
+
+      <h3>5.2 Migrar somente o data directory técnico</h3>
+      <div class="notice warn">
+        Esta cópia não importa os shares Samba. Ela preserva o estado interno
+        da instalação Nextcloud atual, como <code>.ocdata</code>,
+        <code>appdata_*</code> e a consistência com o banco. Trocar por um
+        diretório vazio sem reinstalar o Nextcloud não é suportado.
+      </div>
+      <pre><code>cd /home/rafael/git/scripts_servidor/nextcloud/docker
+docker compose stop app
+
+NC_DATA_SOURCE="$(
+  docker volume inspect docker_nc_data \
+    --format '{{.Mountpoint}}'
+)"
+test -d "$NC_DATA_SOURCE"
+
+rsync -aHAX --numeric-ids --info=progress2 \
+  "$NC_DATA_SOURCE/" \
+  /srv/nextcloud-storage/app-data/
+
+rsync -aHAXn --numeric-ids --itemize-changes \
+  "$NC_DATA_SOURCE/" \
+  /srv/nextcloud-storage/app-data/</code></pre>
+
+      <p>O dry-run final também deve ficar vazio.</p>
+
+      <h3>5.3 Alterar o Compose</h3>
+      <p>Faça backup antes de editar:</p>
+      <pre><code>cp -a docker-compose.yml \
+  "/root/docker-compose.before-local-disk.$(date -u +%Y%m%dT%H%M%SZ).yml"</code></pre>
+
+      <p>No serviço <code>app</code>, remova:</p>
+      <pre><code>- nc_data:/var/www/html/data
+- /mnt/nextcloud-data/publico:/mnt/samba/publico
+- /mnt/nextcloud-data/usuarios:/mnt/samba/usuarios
+- /mnt/nextcloud-data/laudos:/mnt/samba/laudos
+- /mnt/nextcloud-data/laudos-mega:/mnt/samba/laudos-mega
+- /mnt/nextcloud-data/administrativo:/mnt/samba/administrativo</code></pre>
+
+      <p>E adicione:</p>
+      <pre><code>- /srv/nextcloud-storage/app-data:/var/www/html/data
+- /srv/nextcloud-storage/shares:/mnt/storage/shares</code></pre>
+
+      <p>Valide antes de subir:</p>
+      <pre><code>docker compose config --quiet
+docker compose config | sed -n '/volumes:/,/networks:/p'
+findmnt /srv/nextcloud-storage</code></pre>
+
+      <h3>5.4 Subir e ajustar External Storages</h3>
+      <pre><code>docker compose up -d
+
+for attempt in $(seq 1 60); do
+  docker exec -u www-data nextcloud-app \
+    php occ status --output=json &amp;&amp; break
+  sleep 5
+done</code></pre>
+
+      <p>Mantenha maintenance mode ligado. Ajuste os storages existentes por
+        nome, sem assumir IDs numéricos:</p>
+      <pre><code>occ() {
+  docker exec -u www-data nextcloud-app php occ "$@"
+}
+
+set_storage_path() {
+  local mount_point="$1"
+  local new_path="$2"
+  local id
+  id="$(
+    occ files_external:list --output=json |
+      jq -r --arg mount "$mount_point" \
+        '.[] | select(.mount_point == $mount) | .mount_id'
+  )"
+  [[ "$id" =~ ^[0-9]+$ ]] || {
+    echo "Storage ausente ou duplicado: $mount_point" &gt;&amp;2
+    return 1
+  }
+  occ files_external:config "$id" datadir "$new_path"
+}
+
+set_storage_path "/Publico" \
+  "/mnt/storage/shares/publico"
+set_storage_path "/Minha pasta" \
+  '/mnt/storage/shares/usuarios/$user'
+set_storage_path "/Usuarios - Administração" \
+  "/mnt/storage/shares/usuarios"
+set_storage_path "/Laudos" \
+  "/mnt/storage/shares/laudos"
+set_storage_path "/Laudos-Mega" \
+  "/mnt/storage/shares/laudos/mega"
+set_storage_path "/Administrativo" \
+  "/mnt/storage/shares/administrativo"
+
+occ files_external:list</code></pre>
+
+      <p>Confira também os grupos:</p>
+      <table>
+        <thead><tr><th>Storage</th><th>Novo path no container</th><th>Grupos</th></tr></thead>
+        <tbody>
+          <tr><td>Publico</td><td><code>/mnt/storage/shares/publico</code></td><td><code>samba-users</code>, <code>samba-admin</code></td></tr>
+          <tr><td>Minha pasta</td><td><code>/mnt/storage/shares/usuarios/$user</code></td><td><code>samba-users</code>, <code>samba-admin</code></td></tr>
+          <tr><td>Usuarios - Administração</td><td><code>/mnt/storage/shares/usuarios</code></td><td><code>samba-admin</code></td></tr>
+          <tr><td>Laudos</td><td><code>/mnt/storage/shares/laudos</code></td><td><code>samba-laudos</code>, <code>samba-admin</code></td></tr>
+          <tr><td>Laudos-Mega</td><td><code>/mnt/storage/shares/laudos/mega</code></td><td><code>samba-laudos-mega</code>, <code>samba-admin</code></td></tr>
+          <tr><td>Administrativo</td><td><code>/mnt/storage/shares/administrativo</code></td><td><code>samba-administrativo</code>, <code>samba-admin</code></td></tr>
+        </tbody>
+      </table>
+
+      <p>Depois que todos estiverem verdes:</p>
+      <pre><code>docker exec -u www-data nextcloud-app \
+  php occ files:scan --all
+
+docker exec -u www-data nextcloud-app \
+  php occ maintenance:mode --off
+
+systemctl start \
+  nextcloud-cron.timer \
+  nextcloud-files-scan.timer</code></pre>
+
+      <div class="notice warn">
+        Não reative <code>sync-nextcloud-state.timer</code> enquanto Samba e o
+        exportador estiverem desligados.
+      </div>
+
+      <h3>5.5 Remover a dependência CIFS</h3>
+      <p>Somente após validar o novo storage:</p>
+      <pre><code>cp -a \
+  /etc/systemd/system/docker.service.d/nextcloud-cifs.conf \
+  /root/nextcloud-cifs.conf.backup
+
+rm -f \
+  /etc/systemd/system/docker.service.d/nextcloud-cifs.conf
+systemctl daemon-reload</code></pre>
+
+      <p>Edite `/etc/fstab` e comente somente as cinco linhas CIFS antigas.
+        Depois desmonte sem usar opções forçadas:</p>
+      <pre><code>umount /mnt/nextcloud-data/publico
+umount /mnt/nextcloud-data/usuarios
+umount /mnt/nextcloud-data/laudos
+umount /mnt/nextcloud-data/laudos-mega
+umount /mnt/nextcloud-data/administrativo
+
+findmnt --verify
+mount -a</code></pre>
+
+      <h3>5.6 Desligar o Samba, sem apagar nada</h3>
+      <p>No fileserver:</p>
+      <pre><code>systemctl disable --now export-nextcloud-state.timer
+systemctl disable --now smbd
+systemctl disable --now nmbd 2&gt;/dev/null || true
+
+systemctl is-active smbd
+systemctl is-enabled smbd</code></pre>
+
+      <div class="notice danger">
+        Não exclua a VM fileserver, usuários, TDBs, ACLs ou dados originais.
+        Desligue a VM e mantenha os snapshots durante o período de aceitação.
+      </div>
+    </section>
+
+    <section id="validar">
+      <h2><span class="step">6</span>Validar e testar reboot</h2>
+      <pre><code>findmnt /srv/nextcloud-storage
+df -hT /srv/nextcloud-storage
+
+docker inspect nextcloud-app --format \
+  '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+
+docker exec -u www-data nextcloud-app \
+  php occ status --output=json
+
+systemctl is-enabled nextcloud-cron.timer
+systemctl is-active nextcloud-cron.timer
+systemctl is-enabled nextcloud-files-scan.timer
+systemctl is-active nextcloud-files-scan.timer
+systemctl is-enabled sync-nextcloud-state.timer</code></pre>
+
+      <p>O último comando deve indicar <code>disabled</code>.</p>
+
+      <h3>Checklist funcional</h3>
+      <label class="check"><input type="checkbox"> Login pelo hostname público funciona.</label>
+      <label class="check"><input type="checkbox"> Login por WARP/LAN funciona.</label>
+      <label class="check"><input type="checkbox"> Publico abre e permite gravação.</label>
+      <label class="check"><input type="checkbox"> Minha pasta aponta para o usuário correto.</label>
+      <label class="check"><input type="checkbox"> Laudos, Laudos-Mega e Administrativo respeitam grupos.</label>
+      <label class="check"><input type="checkbox"> Usuarios - Administração aparece somente para samba-admin.</label>
+      <label class="check"><input type="checkbox"> Os shares começam vazios, conforme planejado.</label>
+
+      <h3>Teste de reboot</h3>
+      <div class="notice warn">
+        Faça outro snapshot antes do primeiro reboot pós-migração.
+      </div>
+      <pre><code>reboot</code></pre>
+
+      <p>Após voltar:</p>
+      <pre><code>findmnt /srv/nextcloud-storage
+systemctl status docker --no-pager
+docker ps
+docker exec -u www-data nextcloud-app \
+  php occ status --output=json
+curl --fail --head https://cloud.applaupertec.com/status.php</code></pre>
+
+      <div class="notice ok">
+        A migração termina somente depois do reboot validado, de testes com
+        usuários reais e de um novo backup completo incluindo o disco.
+      </div>
+    </section>
+
+    <section id="operar">
+      <h2><span class="step">7</span>Operar sem o Samba</h2>
+      <h3>Novos usuários</h3>
+      <p>Crie a conta e os grupos diretamente no Nextcloud. Como o storage
+        <strong>Minha pasta</strong> usa <code>$user</code>, crie também o
+        diretório correspondente na VM Nextcloud:</p>
+      <pre><code>USUARIO="novo_usuario"
+[[ "$USUARIO" =~ ^[a-z_][a-z0-9_-]*$ ]] || exit 1
+
+install -d -o 33 -g 33 -m 0770 \
+  "/srv/nextcloud-storage/shares/usuarios/$USUARIO"</code></pre>
+
+      <p>Não recrie o usuário no Samba enquanto esta arquitetura estiver
+        ativa. O timer <code>sync-nextcloud-state.timer</code> deve continuar
+        desabilitado.</p>
+    </section>
+
+    <section id="rollback">
+      <h2><span class="step">R</span>Rollback</h2>
+      <p>Se qualquer validação falhar antes de liberar usuários:</p>
+      <ol>
+        <li>ative maintenance mode;</li>
+        <li>pare o container app;</li>
+        <li>restaure o `docker-compose.yml` anterior;</li>
+        <li>restaure o drop-in CIFS;</li>
+        <li>remova o drop-in do disco novo;</li>
+        <li>descomente as cinco linhas CIFS no `fstab`, comente o mount do
+          disco novo e monte os CIFS;</li>
+        <li>ligue a VM fileserver e o `smbd`;</li>
+        <li>suba o Compose anterior;</li>
+        <li>restaure os seis paths dos External Storages;</li>
+        <li>restaure os timers somente após validar.</li>
+      </ol>
+
+      <p>No fileserver:</p>
+      <pre><code>systemctl enable --now smbd</code></pre>
+
+      <p>Na VM Nextcloud:</p>
+      <pre><code># Edite /etc/fstab:
+# - descomente as cinco linhas CIFS;
+# - comente a linha de /srv/nextcloud-storage.
+
+mount -a
+findmnt /mnt/nextcloud-data/publico
+
+cp -a /root/docker-compose.before-local-disk.TIMESTAMP.yml \
+  /home/rafael/git/scripts_servidor/nextcloud/docker/docker-compose.yml
+
+cp -a /root/nextcloud-cifs.conf.backup \
+  /etc/systemd/system/docker.service.d/nextcloud-cifs.conf
+
+rm -f \
+  /etc/systemd/system/docker.service.d/nextcloud-storage.conf
+
+systemctl daemon-reload
+cd /home/rafael/git/scripts_servidor/nextcloud/docker
+docker compose up -d
+
+for attempt in $(seq 1 60); do
+  docker exec -u www-data nextcloud-app \
+    php occ status --output=json &amp;&amp; break
+  sleep 5
+done
+
+occ() {
+  docker exec -u www-data nextcloud-app php occ "$@"
+}
+restore_storage_path() {
+  local mount_point="$1"
+  local old_path="$2"
+  local id
+  id="$(
+    occ files_external:list --output=json |
+      jq -r --arg mount "$mount_point" \
+        '.[] | select(.mount_point == $mount) | .mount_id'
+  )"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 1
+  occ files_external:config "$id" datadir "$old_path"
+}
+
+restore_storage_path "/Publico" "/mnt/samba/publico"
+restore_storage_path "/Minha pasta" '/mnt/samba/usuarios/$user'
+restore_storage_path "/Usuarios - Administração" "/mnt/samba/usuarios"
+restore_storage_path "/Laudos" "/mnt/samba/laudos"
+restore_storage_path "/Laudos-Mega" "/mnt/samba/laudos-mega"
+restore_storage_path "/Administrativo" "/mnt/samba/administrativo"
+
+docker exec -u www-data nextcloud-app \
+  php occ maintenance:mode --off</code></pre>
+
+      <div class="notice danger">
+        Não copie dados de volta automaticamente após o novo storage receber
+        gravações. Isso exige reconciliação bidirecional e decisão explícita
+        sobre qual lado é a fonte correta.
+      </div>
+
+      <h3>Depois da aceitação</h3>
+      <ul>
+        <li>mantenha a VM fileserver desligada por um período acordado;</li>
+        <li>faça backup do novo disco e teste restauração;</li>
+        <li>documente que usuários passam a ser geridos no Nextcloud;</li>
+        <li>revise retenção dos snapshots antes de removê-los;</li>
+        <li>não apague os dados Samba sem aprovação separada.</li>
+      </ul>
+
+    </section>
+  </main>
+
+  <footer>
+    Migração Samba → armazenamento local Nextcloud. Guia operacional; revise
+    devices, UUIDs e paths antes de executar comandos destrutivos.
+  </footer>
+</body>
+</html>
