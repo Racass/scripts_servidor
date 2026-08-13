@@ -36,19 +36,33 @@ não fica no ambiente normal do container e pode ser removida do `.env`.
 O Nextcloud publica HTTP somente em `127.0.0.1:8080`. A porta não deve ser
 exposta diretamente à LAN ou ao WARP.
 
-## CIFS
+## Disco dedicado
 
 Instale o drop-in:
 
 ```bash
 install -D -m 0644 \
-  nextcloud/systemd/docker-nextcloud-cifs.conf \
-  /etc/systemd/system/docker.service.d/nextcloud-cifs.conf
+  nextcloud/systemd/docker-nextcloud-storage.conf \
+  /etc/systemd/system/docker.service.d/nextcloud-storage.conf
 
 systemctl daemon-reload
 ```
 
-Isso impede o Docker de iniciar antes dos cinco mounts CIFS.
+Isso impede o Docker de iniciar antes do mount
+`/srv/nextcloud-storage`. O Compose usa:
+
+```text
+/srv/nextcloud-storage/app-data -> /var/www/html/data
+/srv/nextcloud-storage/shares   -> /mnt/storage/shares
+```
+
+Os shares são locais e começam vazios. O storage `Laudos-Mega` aponta para
+`/mnt/storage/shares/laudos/mega`, compartilhando o mesmo subdiretório físico
+visível em `Laudos`.
+
+Enquanto o fileserver Samba estiver desligado, mantenha
+`sync-nextcloud-state.timer` desabilitado e administre usuários e grupos
+diretamente no Nextcloud.
 
 ## HTTPS privado
 

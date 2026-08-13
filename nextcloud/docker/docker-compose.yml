@@ -21,12 +21,8 @@ services:
       - db
     volumes:
       - nc_html:/var/www/html
-      - nc_data:/var/www/html/data
-      - /mnt/nextcloud-data/publico:/mnt/samba/publico
-      - /mnt/nextcloud-data/usuarios:/mnt/samba/usuarios
-      - /mnt/nextcloud-data/laudos:/mnt/samba/laudos
-      - /mnt/nextcloud-data/laudos-mega:/mnt/samba/laudos-mega
-      - /mnt/nextcloud-data/administrativo:/mnt/samba/administrativo
+      - /srv/nextcloud-storage/app-data:/var/www/html/data
+      - /srv/nextcloud-storage/shares:/mnt/storage/shares
     environment:
       MYSQL_HOST: db
       MYSQL_DATABASE: nextcloud
@@ -37,4 +33,3 @@ services:
 volumes:
   db_data:
   nc_html:
-  nc_data:
