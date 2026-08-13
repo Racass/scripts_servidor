@@ -23,4 +23,5 @@ NoNewPrivileges=true
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/samba/private/passdb.tdb
 TimeoutStartSec=5min

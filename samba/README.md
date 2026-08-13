@@ -15,6 +15,11 @@ apt-get install jq
 As ferramentas `getent`, `pdbedit`, `testparm`, `flock` e coreutils tambem
 devem estar disponiveis.
 
+Embora a operacao seja somente leitura, `pdbedit -L` abre `passdb.tdb` em
+modo read-write para locking. Por isso a unidade systemd libera somente
+`/var/lib/samba/private/passdb.tdb` dentro do sandbox `ProtectSystem=strict`.
+O exportador nao executa nenhum subcomando de alteracao.
+
 ## Instalacao
 
 Antes da primeira execucao, a conta/grupo de transporte `nextcloud-sync`
