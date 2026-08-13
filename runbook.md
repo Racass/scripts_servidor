@@ -136,6 +136,22 @@ getent group samba-users samba-admin samba-laudos \
   samba-laudos-mega samba-administrativo
 ```
 
+Instale o criador seguro de usuários:
+
+```bash
+install -o root -g root -m 0755 \
+  /home/rafael/git/scripts_servidor/samba/criar_usuario_samba \
+  /usr/local/sbin/criar-usuario-samba
+```
+
+Ele preserva integralmente `fileserver.conf`, não reinicia o Samba, bloqueia
+login Linux, aplica e valida as ACLs pessoais, possui rollback restrito aos
+recursos da execução e publica o snapshot para o Nextcloud. Use:
+
+```bash
+criar-usuario-samba
+```
+
 ## 6. Exportador Samba
 
 No fileserver:

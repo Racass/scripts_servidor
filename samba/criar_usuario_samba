@@ -1,1032 +1,533 @@
 #!/bin/bash
 
-# ============================================================
-# CRIAR USUÁRIO SAMBA
-# Debian Fileserver
-#
-# Estrutura:
-#
-# /srv/files/
-# ├── publico/
-# ├── usuarios/
-# │   ├── usuario1/
-# │   └── usuario2/
-# ├── laudos/
-# │   └── mega/
-# └── administrativo/
-#
-# Grupos:
-#
-# samba-users
-#     -> acesso ao Publico
-#     -> acesso à própria pasta em Usuarios
-#
-# samba-admin
-#     -> acesso administrativo a tudo
-#
-# samba-laudos
-#     -> acesso a /laudos
-#
-# samba-laudos-mega
-#     -> acesso a /laudos/mega
-#
-# samba-administrativo
-#     -> acesso a /administrativo
-#
-# ============================================================
-
-
-# ============================================================
-# MODO SEGURO DO BASH
-# ============================================================
-
 set -Eeuo pipefail
-
-
-# ============================================================
-# CONFIGURAÇÕES
-# ============================================================
-
-BASE="/srv/files"
-
-PUBLIC="$BASE/publico"
-USERS="$BASE/usuarios"
-LAUDOS="$BASE/laudos"
-LAUDOS_MEGA="$BASE/laudos/mega"
-ADMINISTRATIVO="$BASE/administrativo"
-
-
-# Grupos
-
-GROUP_USERS="samba-users"
-GROUP_ADMIN="samba-admin"
-GROUP_LAUDOS="samba-laudos"
-GROUP_LAUDOS_MEGA="samba-laudos-mega"
-GROUP_ADMINISTRATIVO="samba-administrativo"
-
-
-# Samba
-
-SAMBA_CONF="/etc/samba/smb.conf"
-SAMBA_FILES_CONF="/etc/samba/fileserver.conf"
-
-BACKUP_DIR="/etc/samba/backup"
-
-
-# Usuário atual
-
-USERNAME=""
-
-
-# Controle do rollback
-
-USER_CREATED=0
-SAMBA_CREATED=0
-DIR_CREATED=0
-
-MAIN_CONF_MODIFIED=0
-FILES_CONF_CREATED=0
-
-MAIN_BACKUP=""
-FILES_BACKUP=""
-
-
-# ============================================================
-# CORES
-# ============================================================
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-
-# ============================================================
-# FUNÇÕES DE SAÍDA
-# ============================================================
-
-erro() {
-    echo
-    echo -e "${RED}ERRO: $1${NC}"
-    echo
-}
-
-
-sucesso() {
-    echo -e "${GREEN}$1${NC}"
-}
-
-
-aviso() {
-    echo -e "${YELLOW}$1${NC}"
-}
-
-
-info() {
-    echo -e "${BLUE}$1${NC}"
-}
-
-
-# ============================================================
-# ROLLBACK
-#
-# Se qualquer etapa crítica falhar, tentamos desfazer somente
-# aquilo que foi criado/modificado durante esta execução.
-# ============================================================
-
-rollback() {
-
-    echo
-    echo "============================================================"
-    echo " ERRO DETECTADO - INICIANDO ROLLBACK"
-    echo "============================================================"
-    echo
-
-
-    # --------------------------------------------------------
-    # Restaurar smb.conf principal
-    # --------------------------------------------------------
-
-    if [ "$MAIN_CONF_MODIFIED" -eq 1 ] &&
-       [ -n "$MAIN_BACKUP" ] &&
-       [ -f "$MAIN_BACKUP" ]; then
-
-        echo "Restaurando smb.conf principal..."
-
-        cp "$MAIN_BACKUP" "$SAMBA_CONF" || true
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Restaurar fileserver.conf
-    #
-    # Se existia antes, restauramos.
-    # Se não existia, removemos o arquivo criado.
-    # --------------------------------------------------------
-
-    if [ "$FILES_CONF_CREATED" -eq 1 ]; then
-
-        if [ -n "$FILES_BACKUP" ] &&
-           [ -f "$FILES_BACKUP" ]; then
-
-            echo "Restaurando fileserver.conf..."
-
-            cp "$FILES_BACKUP" "$SAMBA_FILES_CONF" || true
-
-        else
-
-            echo "Removendo fileserver.conf criado..."
-
-            rm -f "$SAMBA_FILES_CONF" || true
-
-        fi
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Remover usuário Samba
-    # --------------------------------------------------------
-
-    if [ "$SAMBA_CREATED" -eq 1 ]; then
-
-        echo "Removendo usuário do Samba..."
-
-        smbpasswd -x "$USERNAME" \
-            >/dev/null 2>&1 || true
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Remover usuário Linux
-    # --------------------------------------------------------
-
-    if [ "$USER_CREATED" -eq 1 ]; then
-
-        echo "Removendo usuário Linux..."
-
-        userdel -r "$USERNAME" \
-            >/dev/null 2>&1 || true
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Remover pasta pessoal
-    # --------------------------------------------------------
-
-    if [ "$DIR_CREATED" -eq 1 ]; then
-
-        echo "Removendo diretório pessoal..."
-
-        rm -rf "$USERS/$USERNAME" || true
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Reiniciar Samba com configuração anterior
-    # --------------------------------------------------------
-
-    systemctl restart smbd \
-        >/dev/null 2>&1 || true
-
-
-    echo
-    echo "Rollback concluído."
-    echo
-
-}
-
-
-# ============================================================
-# TRATAMENTO GLOBAL DE ERRO
-# ============================================================
-
-on_error() {
-
-    local EXIT_CODE=$?
-
-    erro "Falha na linha $1."
-
-    rollback
-
-    exit "$EXIT_CODE"
-}
-
-
-trap 'on_error $LINENO' ERR
-
-
-# ============================================================
-# VERIFICAR ROOT
-# ============================================================
-
-if [ "$EUID" -ne 0 ]; then
-
-    erro "Este script precisa ser executado como root."
-
-    echo "Execute:"
-    echo
-    echo "  sudo ./criar_usuario_samba.sh"
-
-    exit 1
-
-fi
-
-
-# ============================================================
-# CABEÇALHO
-# ============================================================
-
-clear
-
-echo
-echo "============================================================"
-echo "       CRIAÇÃO DE USUÁRIO - DEBIAN FILESERVER"
-echo "============================================================"
-echo
-
-
-# ============================================================
-# VERIFICAR DEPENDÊNCIAS
-# ============================================================
-
-echo "==> Verificando dependências..."
-
-REQUIRED_COMMANDS=(
-    "useradd"
-    "usermod"
-    "passwd"
-    "smbpasswd"
-    "testparm"
-    "setfacl"
-    "getfacl"
-    "systemctl"
-)
-
-
-for COMMAND in "${REQUIRED_COMMANDS[@]}"; do
-
-    if ! command -v "$COMMAND" >/dev/null 2>&1; then
-
-        erro "Comando obrigatório não encontrado: $COMMAND"
-
-        exit 1
-
-    fi
-
-done
-
-
-sucesso "Dependências OK."
-
-
-# ============================================================
-# VERIFICAR GRUPOS
-# ============================================================
-
-echo
-echo "==> Verificando grupos Samba..."
-
-REQUIRED_GROUPS=(
+umask 077
+export LC_ALL=C
+
+readonly BASE="/srv/files"
+readonly USERS_DIR="$BASE/usuarios"
+readonly SAMBA_MAIN_CONF="/etc/samba/smb.conf"
+readonly SAMBA_FILES_CONF="/etc/samba/fileserver.conf"
+readonly LOCK_DIR="/run/criar-usuario-samba"
+readonly LOCK_FILE="$LOCK_DIR/provision.lock"
+readonly STATE_FILE="/var/lib/samba-nextcloud-export/state.json"
+readonly STATE_VALIDATOR="/usr/local/lib/samba-nextcloud/validate-nextcloud-state.jq"
+readonly EXPORT_SERVICE="export-nextcloud-state.service"
+
+readonly GROUP_USERS="samba-users"
+readonly GROUP_ADMIN="samba-admin"
+readonly GROUP_LAUDOS="samba-laudos"
+readonly GROUP_LAUDOS_MEGA="samba-laudos-mega"
+readonly GROUP_ADMINISTRATIVO="samba-administrativo"
+readonly -a MANAGED_GROUPS=(
     "$GROUP_USERS"
     "$GROUP_ADMIN"
     "$GROUP_LAUDOS"
     "$GROUP_LAUDOS_MEGA"
     "$GROUP_ADMINISTRATIVO"
 )
-
-
-for GROUP in "${REQUIRED_GROUPS[@]}"; do
-
-    if ! getent group "$GROUP" >/dev/null 2>&1; then
-
-        erro "Grupo obrigatório não existe: $GROUP"
-
-        echo
-        echo "Crie o grupo com:"
-        echo
-        echo "  groupadd $GROUP"
-        echo
-
-        exit 1
-
-    fi
-
-    echo "    OK: $GROUP"
-
-done
-
-
-# ============================================================
-# VERIFICAR ESTRUTURA DE DIRETÓRIOS
-# ============================================================
-
-echo
-echo "==> Verificando estrutura de diretórios..."
-
-REQUIRED_DIRS=(
-    "$PUBLIC"
-    "$USERS"
-    "$LAUDOS"
-    "$LAUDOS_MEGA"
-    "$ADMINISTRATIVO"
+readonly -a PROTECTED_USERS=(
+    "admin"
+    "nextcloud_user"
 )
 
+USERNAME=""
+HOME_DIR=""
+USER_DIR=""
+CREATED_UID=""
+USER_CREATED=0
+SAMBA_CREATED=0
+USER_DIR_CREATED=0
+COMMITTED=0
+ROLLBACK_DONE=0
 
-for DIRECTORY in "${REQUIRED_DIRS[@]}"; do
-
-    if [ ! -d "$DIRECTORY" ]; then
-
-        aviso "Diretório não existe: $DIRECTORY"
-
-        echo "Criando..."
-
-        mkdir -p "$DIRECTORY"
-
-    fi
-
-done
-
-
-sucesso "Estrutura de diretórios OK."
-
-
-# ============================================================
-# FUNÇÃO PARA ADICIONAR GRUPO OPCIONAL
-# ============================================================
-
-adicionar_grupo_opcional() {
-
-    local GROUP="$1"
-    local DESCRIPTION="$2"
-
-
-    echo
-
-    read -rp \
-        "Adicionar $USERNAME ao grupo $DESCRIPTION ($GROUP)? [s/N]: " \
-        ADD_GROUP
-
-
-    if [[ "$ADD_GROUP" =~ ^[Ss]$ ]]; then
-
-        usermod -aG "$GROUP" "$USERNAME"
-
-        echo
-        sucesso "Usuário adicionado ao grupo $GROUP."
-
-    else
-
-        echo
-        echo "Usuário NÃO será adicionado ao grupo $GROUP."
-
-    fi
-
+log() {
+    local level="$1"
+    shift
+    printf '[%s] %s\n' "$level" "$*" >&2
 }
 
-
-# ============================================================
-# NOME DO USUÁRIO
-# ============================================================
-
-echo
-echo "============================================================"
-echo " NOVO USUÁRIO"
-echo "============================================================"
-echo
-
-read -rp "Nome do novo usuário: " USERNAME
-
-
-# ============================================================
-# VALIDAR NOME
-# ============================================================
-
-if [ -z "$USERNAME" ]; then
-
-    erro "Nome de usuário vazio."
-
-    exit 1
-
-fi
-
-
-if [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-
-    erro "Nome de usuário inválido."
-
-    echo
-    echo "Use somente:"
-    echo "  letras minúsculas"
-    echo "  números"
-    echo "  _"
-    echo "  -"
-    echo
-
-    exit 1
-
-fi
-
-
-# ============================================================
-# VERIFICAR SE USUÁRIO JÁ EXISTE
-# ============================================================
-
-if id "$USERNAME" >/dev/null 2>&1; then
-
-    erro "O usuário '$USERNAME' já existe."
-
-    exit 1
-
-fi
-
-
-# ============================================================
-# CRIAR USUÁRIO LINUX
-# ============================================================
-
-echo
-echo "==> Criando usuário Linux..."
-
-useradd \
-    -m \
-    -s /bin/bash \
-    "$USERNAME"
-
-USER_CREATED=1
-
-sucesso "Usuário Linux criado."
-
-
-# ============================================================
-# SENHA LINUX
-# ============================================================
-
-echo
-echo "==> Defina a senha do usuário Linux:"
-echo
-
-passwd "$USERNAME"
-
-
-# ============================================================
-# GRUPO BASE
-# ============================================================
-
-echo
-echo "==> Adicionando usuário ao grupo obrigatório:"
-echo
-echo "    $GROUP_USERS"
-
-usermod -aG "$GROUP_USERS" "$USERNAME"
-
-sucesso "Usuário adicionado ao grupo $GROUP_USERS."
-
-
-# ============================================================
-# GRUPOS OPCIONAIS
-# ============================================================
-
-echo
-echo "============================================================"
-echo " GRUPOS OPCIONAIS"
-echo "============================================================"
-
-
-adicionar_grupo_opcional \
-    "$GROUP_ADMIN" \
-    "Administradores"
-
-
-adicionar_grupo_opcional \
-    "$GROUP_LAUDOS" \
-    "Laudos"
-
-
-adicionar_grupo_opcional \
-    "$GROUP_LAUDOS_MEGA" \
-    "Laudos Mega"
-
-
-adicionar_grupo_opcional \
-    "$GROUP_ADMINISTRATIVO" \
-    "Administrativo"
-
-
-# ============================================================
-# SENHA SAMBA
-# ============================================================
-
-echo
-echo "============================================================"
-echo " SENHA DO SAMBA"
-echo "============================================================"
-echo
-
-echo "Defina a senha que será utilizada no acesso Windows."
-echo
-
-smbpasswd -a "$USERNAME"
-
-SAMBA_CREATED=1
-
-
-echo
-echo "==> Ativando usuário no Samba..."
-
-smbpasswd -e "$USERNAME"
-
-sucesso "Usuário Samba criado e ativado."
-
-
-# ============================================================
-# CRIAR DIRETÓRIO PESSOAL
-# ============================================================
-
-USER_DIR="$USERS/$USERNAME"
-
-
-echo
-echo "==> Criando diretório pessoal:"
-echo
-echo "    $USER_DIR"
-echo
-
-
-mkdir -p "$USER_DIR"
-
-DIR_CREATED=1
-
-
-# ============================================================
-# PERMISSÕES DA PASTA PESSOAL
-# ============================================================
-
-echo
-echo "==> Configurando permissões da pasta pessoal..."
-
-
-# ------------------------------------------------------------
-# Proprietário
-# ------------------------------------------------------------
-
-chown "$USERNAME:$GROUP_USERS" "$USER_DIR"
-
-
-# ------------------------------------------------------------
-# Permissões base
-# ------------------------------------------------------------
-
-chmod 0700 "$USER_DIR"
-
-
-# ------------------------------------------------------------
-# Usuário
-# ------------------------------------------------------------
-
-setfacl -m "u:$USERNAME:rwx" "$USER_DIR"
-
-
-# ------------------------------------------------------------
-# Administradores
-# ------------------------------------------------------------
-
-setfacl -m "g:$GROUP_ADMIN:rwx" "$USER_DIR"
-
-
-# ------------------------------------------------------------
-# Samba-users NÃO acessa pasta de outros usuários
-# ------------------------------------------------------------
-
-setfacl -m "g:$GROUP_USERS:---" "$USER_DIR"
-
-
-# ------------------------------------------------------------
-# Outros
-# ------------------------------------------------------------
-
-setfacl -m "o::---" "$USER_DIR"
-
-
-# ============================================================
-# ACL PADRÃO DA PASTA PESSOAL
-# ============================================================
-
-echo
-echo "==> Configurando ACL padrão..."
-
-
-setfacl -d -m "u::rwx" "$USER_DIR"
-
-setfacl -d -m "g::---" "$USER_DIR"
-
-setfacl -d -m "g:$GROUP_ADMIN:rwx" "$USER_DIR"
-
-setfacl -d -m "o::---" "$USER_DIR"
-
-
-# ============================================================
-# BACKUP DO SAMBA
-# ============================================================
-
-echo
-echo "============================================================"
-echo " BACKUP DAS CONFIGURAÇÕES SAMBA"
-echo "============================================================"
-echo
-
-
-mkdir -p "$BACKUP_DIR"
-
-
-TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
-
-
-MAIN_BACKUP="$BACKUP_DIR/smb.conf.$TIMESTAMP"
-
-FILES_BACKUP="$BACKUP_DIR/fileserver.conf.$TIMESTAMP"
-
-
-# ------------------------------------------------------------
-# Backup do smb.conf principal
-# ------------------------------------------------------------
-
-cp "$SAMBA_CONF" "$MAIN_BACKUP"
-
-MAIN_CONF_MODIFIED=1
-
-echo "Backup:"
-echo "  $MAIN_BACKUP"
-
-
-# ------------------------------------------------------------
-# Backup do fileserver.conf, se existir
-# ------------------------------------------------------------
-
-if [ -f "$SAMBA_FILES_CONF" ]; then
-
-    cp "$SAMBA_FILES_CONF" "$FILES_BACKUP"
-
-    echo "Backup:"
-    echo "  $FILES_BACKUP"
-
-fi
-
-
-# ============================================================
-# GERAR CONFIGURAÇÃO DO FILESERVER
-# ============================================================
-
-echo
-echo "==> Atualizando fileserver.conf..."
-
-
-cat > "$SAMBA_FILES_CONF" <<EOF
-# ============================================================
-# Debian Fileserver
-#
-# Arquivo gerenciado por:
-# criar_usuario_samba.sh
-# ============================================================
-
-
-[Publico]
-
-    path = $PUBLIC
-
-    browseable = yes
-    read only = no
-
-    valid users = +$GROUP_USERS +$GROUP_ADMIN
-
-    force group = $GROUP_USERS
-
-    create mask = 0660
-    directory mask = 2770
-
-    inherit permissions = yes
-    inherit acls = yes
-
-
-[Usuarios]
-
-    path = $USERS
-
-    browseable = yes
-    read only = no
-
-    valid users = +$GROUP_USERS +$GROUP_ADMIN
-
-    force group = $GROUP_USERS
-
-    create mask = 0660
-    directory mask = 0770
-
-    inherit permissions = yes
-    inherit acls = yes
-
-    hide unreadable = yes
-
-
-[Laudos]
-
-    path = $LAUDOS
-
-    browseable = yes
-    read only = no
-
-    valid users = +$GROUP_LAUDOS +$GROUP_ADMIN
-
-    force group = $GROUP_LAUDOS
-
-    create mask = 0660
-    directory mask = 2770
-
-    inherit permissions = yes
-    inherit acls = yes
-
-
-[Laudos-Mega]
-
-    path = $LAUDOS_MEGA
-
-    browseable = yes
-    read only = no
-
-    valid users = +$GROUP_LAUDOS_MEGA +$GROUP_ADMIN
-
-    force group = $GROUP_LAUDOS_MEGA
-
-    create mask = 0660
-    directory mask = 2770
-
-    inherit permissions = yes
-    inherit acls = yes
-
-
-[Administrativo]
-
-    path = $ADMINISTRATIVO
-
-    browseable = yes
-    read only = no
-
-    valid users = +$GROUP_ADMINISTRATIVO +$GROUP_ADMIN
-
-    force group = $GROUP_ADMINISTRATIVO
-
-    create mask = 0660
-    directory mask = 2770
-
-    inherit permissions = yes
-    inherit acls = yes
-
+die() {
+    log "ERROR" "$2"
+    exit "$1"
+}
+
+samba_user_exists() {
+    local user="$1"
+    local output
+    local account
+
+    if ! output="$(pdbedit -L 2>/dev/null)"; then
+        return 2
+    fi
+    while IFS=: read -r account _; do
+        [[ "$account" != "$user" ]] || return 0
+    done <<<"$output"
+    return 1
+}
+
+rollback() {
+    local rollback_failed=0
+    local samba_status
+
+    if [[ "$COMMITTED" -eq 1 || "$ROLLBACK_DONE" -eq 1 ]]; then
+        return
+    fi
+
+    ROLLBACK_DONE=1
+    trap - ERR INT TERM HUP
+    log "WARN" "Falha detectada; revertendo somente recursos desta execucao"
+
+    if [[ "$SAMBA_CREATED" -eq 1 ]]; then
+        if samba_user_exists "$USERNAME"; then
+            smbpasswd -x "$USERNAME" >/dev/null 2>&1 ||
+                rollback_failed=1
+        else
+            samba_status=$?
+            [[ "$samba_status" -ne 2 ]] ||
+                rollback_failed=1
+        fi
+    fi
+
+    if [[ "$USER_DIR_CREATED" -eq 1 && -n "$USER_DIR" &&
+        -e "$USER_DIR" ]]
+    then
+        rm -rf -- "$USER_DIR" ||
+            rollback_failed=1
+    fi
+
+    if [[ "$USER_CREATED" -eq 1 ]] &&
+        [[ "$(id -u "$USERNAME" 2>/dev/null || true)" == "$CREATED_UID" ]]
+    then
+        userdel -r "$USERNAME" >/dev/null 2>&1 ||
+            rollback_failed=1
+    fi
+
+    if ! testparm -s "$SAMBA_MAIN_CONF" >/dev/null 2>&1; then
+        rollback_failed=1
+    fi
+
+    if [[ "$rollback_failed" -eq 0 ]]; then
+        log "WARN" "Rollback concluido"
+    else
+        log "ERROR" "Rollback incompleto; preserve logs e corrija manualmente"
+    fi
+}
+
+on_error() {
+    local rc=$?
+    local line="$1"
+
+    log "ERROR" "Falha na linha $line (exit=$rc)"
+    return "$rc"
+}
+
+on_exit() {
+    local rc=$?
+
+    trap - EXIT
+    if [[ "$rc" -ne 0 && "$COMMITTED" -eq 0 ]] &&
+        (( USER_CREATED || SAMBA_CREATED || USER_DIR_CREATED ))
+    then
+        rollback
+    fi
+    exit "$rc"
+}
+
+on_signal() {
+    log "ERROR" "Execucao interrompida por sinal"
+    exit 130
+}
+
+trap 'on_error "$LINENO"' ERR
+trap on_signal INT TERM HUP
+trap on_exit EXIT
+
+require_root() {
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] ||
+        die 12 "Execute como root"
+}
+
+require_dependencies() {
+    local command
+    local -a commands=(
+        chmod
+        cat
+        chown
+        cut
+        flock
+        getent
+        getfacl
+        grep
+        id
+        install
+        jq
+        mkdir
+        passwd
+        pdbedit
+        rm
+        setfacl
+        smbpasswd
+        stat
+        systemctl
+        testparm
+        useradd
+        userdel
+        usermod
+    )
+
+    for command in "${commands[@]}"; do
+        command -v "$command" >/dev/null 2>&1 ||
+            die 11 "Dependencia ausente: $command"
+    done
+}
+
+validate_environment() {
+    local group
+
+    [[ -d "$USERS_DIR" && ! -L "$USERS_DIR" ]] ||
+        die 10 "Diretorio de usuarios invalido: $USERS_DIR"
+    [[ -f "$SAMBA_MAIN_CONF" && ! -L "$SAMBA_MAIN_CONF" ]] ||
+        die 10 "Configuracao Samba invalida: $SAMBA_MAIN_CONF"
+    [[ -f "$SAMBA_FILES_CONF" && ! -L "$SAMBA_FILES_CONF" ]] ||
+        die 10 "Configuracao de shares invalida: $SAMBA_FILES_CONF"
+    [[ -f "$STATE_VALIDATOR" && ! -L "$STATE_VALIDATOR" ]] ||
+        die 10 "Validador do contrato ausente: $STATE_VALIDATOR"
+
+    for group in "${MANAGED_GROUPS[@]}"; do
+        getent group "$group" >/dev/null ||
+            die 10 "Grupo gerenciado ausente: $group"
+    done
+
+    testparm -s "$SAMBA_MAIN_CONF" >/dev/null ||
+        die 10 "Configuracao Samba atual e invalida"
+    [[ "$(
+        testparm -s \
+            --parameter-name='server role' \
+            "$SAMBA_MAIN_CONF" 2>/dev/null
+    )" == "standalone server" ]] ||
+        die 10 "Samba nao esta em ROLE_STANDALONE"
+    [[ "$(
+        testparm -s \
+            --parameter-name='passdb backend' \
+            "$SAMBA_MAIN_CONF" 2>/dev/null
+    )" == "tdbsam" ]] ||
+        die 10 "Backend Samba nao e tdbsam"
+    systemctl is-active --quiet smbd ||
+        die 10 "Servico smbd nao esta ativo"
+}
+
+prepare_lock() {
+    [[ ! -L "$LOCK_DIR" ]] ||
+        die 20 "Diretorio de lock nao pode ser symlink"
+    if [[ ! -e "$LOCK_DIR" ]]; then
+        install -d -o root -g root -m 0700 "$LOCK_DIR"
+    fi
+    [[ "$(stat -c '%F:%u:%g:%a' "$LOCK_DIR")" == \
+        "directory:0:0:700" ]] ||
+        die 20 "Diretorio de lock inseguro: $LOCK_DIR"
+
+    [[ ! -L "$LOCK_FILE" ]] ||
+        die 20 "Lock nao pode ser symlink"
+    if [[ ! -e "$LOCK_FILE" ]]; then
+        install -o root -g root -m 0600 /dev/null "$LOCK_FILE"
+    fi
+    [[ "$(stat -c '%F:%u:%g:%a' "$LOCK_FILE")" == \
+        "regular empty file:0:0:600" ]] ||
+        die 20 "Arquivo de lock inseguro: $LOCK_FILE"
+}
+
+read_username() {
+    local protected
+    local samba_status
+
+    printf '\nCriacao de usuario Samba + replica Nextcloud\n\n'
+    read -r -p "Username do novo usuario: " USERNAME
+
+    [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
+        die 10 "Username invalido"
+
+    for protected in "${PROTECTED_USERS[@]}"; do
+        [[ "$USERNAME" != "$protected" ]] ||
+            die 10 "Username protegido: $USERNAME"
+    done
+
+    ! getent passwd "$USERNAME" >/dev/null ||
+        die 10 "Usuario Linux ja existe: $USERNAME"
+    if samba_user_exists "$USERNAME"; then
+        die 10 "Usuario tdbsam ja existe: $USERNAME"
+    else
+        samba_status=$?
+        [[ "$samba_status" -ne 2 ]] ||
+            die 10 "Nao foi possivel consultar o tdbsam"
+    fi
+
+    USER_DIR="$USERS_DIR/$USERNAME"
+    HOME_DIR="/home/$USERNAME"
+    [[ ! -e "$USER_DIR" && ! -L "$USER_DIR" ]] ||
+        die 10 "Diretorio pessoal ja existe: $USER_DIR"
+    [[ ! -e "$HOME_DIR" && ! -L "$HOME_DIR" ]] ||
+        die 10 "Home Linux ja existe: $HOME_DIR"
+}
+
+confirm_plan() {
+    local answer
+
+    printf '\nResumo:\n'
+    printf '  username: %s\n' "$USERNAME"
+    printf '  pasta:    %s\n' "$USER_DIR"
+    printf '  base:     %s\n' "$GROUP_USERS"
+    printf '  shell:    /usr/sbin/nologin\n'
+    printf '\nA senha Samba sera solicitada interativamente.\n'
+    read -r -p "Continuar? [s/N]: " answer
+    [[ "$answer" =~ ^[Ss]$ ]] ||
+        die 10 "Operacao cancelada"
+}
+
+ask_optional_group() {
+    local group="$1"
+    local description="$2"
+    local answer
+
+    read -r -p \
+        "Adicionar a $description ($group)? [s/N]: " answer
+    if [[ "$answer" =~ ^[Ss]$ ]]; then
+        usermod -aG "$group" "$USERNAME"
+        log "INFO" "Membership adicionado: $USERNAME -> $group"
+    fi
+}
+
+create_linux_identity() {
+    useradd \
+        --create-home \
+        --user-group \
+        --shell /usr/sbin/nologin \
+        "$USERNAME"
+    CREATED_UID="$(id -u "$USERNAME")"
+    USER_CREATED=1
+
+    passwd -l "$USERNAME" >/dev/null
+    usermod -aG "$GROUP_USERS" "$USERNAME"
+
+    ask_optional_group "$GROUP_ADMIN" "administracao dos shares"
+    ask_optional_group "$GROUP_LAUDOS" "Laudos"
+    ask_optional_group "$GROUP_LAUDOS_MEGA" "Laudos-Mega"
+    ask_optional_group "$GROUP_ADMINISTRATIVO" "Administrativo"
+}
+
+create_samba_identity() {
+    local samba_status
+
+    printf '\nDefina a senha usada no acesso Samba/Windows.\n'
+    smbpasswd -a "$USERNAME"
+    SAMBA_CREATED=1
+    smbpasswd -e "$USERNAME"
+
+    if samba_user_exists "$USERNAME"; then
+        :
+    else
+        samba_status=$?
+        [[ "$samba_status" -ne 2 ]] ||
+            die 63 "Falha ao consultar o tdbsam apos criacao"
+        die 63 "Usuario nao foi persistido no tdbsam"
+    fi
+}
+
+create_personal_directory() {
+    mkdir -- "$USER_DIR"
+    USER_DIR_CREATED=1
+    chown "$USERNAME:$GROUP_USERS" "$USER_DIR"
+    chmod 2770 "$USER_DIR"
+
+    setfacl -b -k "$USER_DIR"
+    setfacl -m \
+        "u::rwx,u:${USERNAME}:rwx,g::---,g:${GROUP_USERS}:---,g:${GROUP_ADMIN}:rwx,m::rwx,o::---" \
+        "$USER_DIR"
+    setfacl -d -m \
+        "u::rwx,g::---,g:${GROUP_ADMIN}:rwx,m::rwx,o::---" \
+        "$USER_DIR"
+}
+
+validate_acl() {
+    local acl
+    local expected
+
+    [[ "$(stat -c '%a:%U:%G' "$USER_DIR")" == \
+        "2770:$USERNAME:$GROUP_USERS" ]] ||
+        die 63 "Owner, grupo ou modo inesperado em $USER_DIR"
+
+    acl="$(getfacl -cp "$USER_DIR")"
+    expected="$(
+        cat <<EOF
+user::rwx
+user:${USERNAME}:rwx
+group::---
+group:${GROUP_USERS}:---
+group:${GROUP_ADMIN}:rwx
+mask::rwx
+other::---
+default:user::rwx
+default:group::---
+default:group:${GROUP_ADMIN}:rwx
+default:mask::rwx
+default:other::---
 EOF
-
-
-FILES_CONF_CREATED=1
-
-
-# ============================================================
-# GARANTIR INCLUDE NO SMB.CONF
-# ============================================================
-
-echo
-echo "==> Verificando include no smb.conf principal..."
-
-
-INCLUDE_LINE="include = $SAMBA_FILES_CONF"
-
-
-if ! grep -Fqx "$INCLUDE_LINE" "$SAMBA_CONF"; then
-
-    echo >> "$SAMBA_CONF"
-
-    echo "# Debian Fileserver" >> "$SAMBA_CONF"
-
-    echo "$INCLUDE_LINE" >> "$SAMBA_CONF"
-
-    echo "Include adicionado."
-
-else
-
-    echo "Include já existe."
-
-fi
-
-
-# ============================================================
-# VALIDAR CONFIGURAÇÃO SAMBA
-# ============================================================
-
-echo
-echo "============================================================"
-echo " VALIDANDO CONFIGURAÇÃO SAMBA"
-echo "============================================================"
-echo
-
-
-if ! testparm -s "$SAMBA_CONF"; then
-
-    erro "O testparm encontrou problemas na configuração Samba."
-
-    rollback
-
-    exit 1
-
-fi
-
-
-sucesso "Configuração Samba válida."
-
-
-# ============================================================
-# REINICIAR SAMBA
-# ============================================================
-
-echo
-echo "==> Reiniciando Samba..."
-
-
-if ! systemctl restart smbd; then
-
-    erro "Falha ao reiniciar o serviço smbd."
-
-    rollback
-
-    exit 1
-
-fi
-
-
-# ============================================================
-# VERIFICAR SERVIÇO
-# ============================================================
-
-echo
-echo "==> Verificando serviço Samba..."
-
-
-if ! systemctl is-active --quiet smbd; then
-
-    erro "O serviço smbd não está ativo."
-
-    rollback
-
-    exit 1
-
-fi
-
-
-sucesso "Samba está ativo."
-
-
-# ============================================================
-# HABILITAR SAMBA NO BOOT
-# ============================================================
-
-systemctl enable smbd >/dev/null 2>&1 || true
-
-
-# ============================================================
-# MOSTRAR GRUPOS DO USUÁRIO
-# ============================================================
-
-echo
-echo "============================================================"
-echo " GRUPOS DO USUÁRIO"
-echo "============================================================"
-echo
-
-
-id "$USERNAME"
-
-
-# ============================================================
-# MOSTRAR ACL
-# ============================================================
-
-echo
-echo "============================================================"
-echo " ACL DA PASTA PESSOAL"
-echo "============================================================"
-echo
-
-
-getfacl "$USER_DIR"
-
-
-# ============================================================
-# RESUMO
-# ============================================================
-
-echo
-echo "============================================================"
-echo -e " ${GREEN}USUÁRIO CRIADO COM SUCESSO${NC}"
-echo "============================================================"
-echo
-
-echo "Usuário Linux : $USERNAME"
-
-echo
-echo "Diretório:"
-echo "  $USER_DIR"
-
-echo
-echo "Grupos:"
-id -nG "$USERNAME"
-
-echo
-echo "Compartilhamentos disponíveis:"
-echo
-echo "  \\\\IP_DO_SERVIDOR\\Publico"
-echo "  \\\\IP_DO_SERVIDOR\\Usuarios"
-echo "  \\\\IP_DO_SERVIDOR\\Laudos"
-echo "  \\\\IP_DO_SERVIDOR\\Laudos-Mega"
-echo "  \\\\IP_DO_SERVIDOR\\Administrativo"
-
-echo
-echo "Regras:"
-echo
-echo "  Publico"
-echo "    -> samba-users"
-echo "    -> samba-admin"
-
-echo
-echo "  Usuarios/<usuario>"
-echo "    -> próprio usuário"
-echo "    -> samba-admin"
-
-echo
-echo "  Laudos"
-echo "    -> samba-laudos"
-echo "    -> samba-admin"
-
-echo
-echo "  Laudos-Mega"
-echo "    -> samba-laudos-mega"
-echo "    -> samba-admin"
-
-echo
-echo "  Administrativo"
-echo "    -> samba-administrativo"
-echo "    -> samba-admin"
-
-echo
-echo "Backup:"
-echo "  $MAIN_BACKUP"
-
-if [ -f "$FILES_BACKUP" ]; then
-    echo "  $FILES_BACKUP"
-fi
-
-echo
-echo "============================================================"
-echo
-
-exit 0
+    )"
+    [[ "$acl" == "$expected" ]] ||
+        die 63 "ACL pessoal diverge do padrao esperado"
+}
+
+validate_identity() {
+    local group
+    local groups
+    local samba_status
+
+    getent passwd "$USERNAME" |
+        grep -Fq ":/home/$USERNAME:/usr/sbin/nologin" ||
+        die 63 "Conta Linux possui home ou shell inesperado"
+    [[ "$(passwd -S "$USERNAME" | cut -d' ' -f2)" == "L" ]] ||
+        die 63 "Senha Linux nao ficou bloqueada"
+
+    groups=" $(id -nG "$USERNAME") "
+    [[ "$groups" == *" $GROUP_USERS "* ]] ||
+        die 63 "Membership obrigatorio ausente"
+
+    for group in "${MANAGED_GROUPS[@]}"; do
+        if [[ "$groups" == *" $group "* ]]; then
+            log "INFO" "Grupo efetivo: $group"
+        fi
+    done
+
+    if samba_user_exists "$USERNAME"; then
+        :
+    else
+        samba_status=$?
+        [[ "$samba_status" -ne 2 ]] ||
+            die 63 "Falha ao consultar o tdbsam durante validacao"
+        die 63 "Conta tdbsam ausente"
+    fi
+    validate_acl
+    testparm -s "$SAMBA_MAIN_CONF" >/dev/null ||
+        die 63 "Configuracao Samba deixou de validar"
+    systemctl is-active --quiet smbd ||
+        die 63 "Servico smbd deixou de estar ativo"
+}
+
+validate_exported_groups() {
+    local group
+    local groups
+
+    groups=" $(id -nG "$USERNAME") "
+    for group in "${MANAGED_GROUPS[@]}"; do
+        if [[ "$groups" == *" $group "* ]]; then
+            jq -e \
+                --arg group "$group" \
+                --arg user "$USERNAME" \
+                '.groups[$group] | index($user) != null' \
+                "$STATE_FILE" >/dev/null ||
+                return 1
+        else
+            jq -e \
+                --arg group "$group" \
+                --arg user "$USERNAME" \
+                '.groups[$group] | index($user) == null' \
+                "$STATE_FILE" >/dev/null ||
+                return 1
+        fi
+    done
+}
+
+publish_nextcloud_state() {
+    if ! systemctl cat "$EXPORT_SERVICE" >/dev/null 2>&1; then
+        log "WARN" \
+            "$EXPORT_SERVICE nao esta instalado; execute o exportador antes do onboarding"
+        return 2
+    fi
+
+    if ! systemctl start "$EXPORT_SERVICE"; then
+        log "ERROR" \
+            "Usuario criado, mas a exportacao falhou; nao execute o apply Nextcloud"
+        return 2
+    fi
+
+    [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || {
+        log "ERROR" "Snapshot nao foi publicado: $STATE_FILE"
+        return 2
+    }
+    jq -e -f "$STATE_VALIDATOR" "$STATE_FILE" >/dev/null || {
+        log "ERROR" "Snapshot publicado viola o contrato estrutural"
+        return 2
+    }
+    jq -e --arg user "$USERNAME" \
+        '.users | index($user) != null' "$STATE_FILE" >/dev/null || {
+        log "ERROR" "Usuario nao apareceu no snapshot publicado"
+        return 2
+    }
+    validate_exported_groups || {
+        log "ERROR" "Memberships exportados divergem do estado Linux"
+        return 2
+    }
+}
+
+print_summary() {
+    printf '\nUsuario criado com sucesso.\n\n'
+    printf '  Linux/Samba: %s\n' "$USERNAME"
+    printf '  Pasta:       %s\n' "$USER_DIR"
+    printf '  Grupos:      %s\n' "$(id -nG "$USERNAME")"
+    if [[ -f "$STATE_FILE" ]]; then
+        printf '  Snapshot:    %s\n' "$STATE_FILE"
+    else
+        printf '  Snapshot:    pendente\n'
+    fi
+    printf '\nProximo passo no host Nextcloud:\n'
+    printf '  sync-nextcloud-state --dry-run\n'
+    printf '  revisar last-plan.json\n'
+    printf '  sync-nextcloud-state --apply-additive --reviewed-generation UUID\n'
+    printf '  concluir novo-usuario-onboarding.html\n\n'
+}
+
+print_partial_summary() {
+    printf '\nConta Samba criada e validada, mas a exportacao esta pendente.\n\n'
+    printf '  Linux/Samba: %s\n' "$USERNAME"
+    printf '  Pasta:       %s\n' "$USER_DIR"
+    printf '  Grupos:      %s\n' "$(id -nG "$USERNAME")"
+    printf '\nNao execute apply nem onboarding no Nextcloud.\n'
+    printf 'Corrija %s e execute o dry-run somente apos o usuario aparecer em:\n' \
+        "$EXPORT_SERVICE"
+    printf '  %s\n\n' "$STATE_FILE"
+}
+
+main() {
+    local export_rc=0
+
+    require_root
+    require_dependencies
+    prepare_lock
+
+    exec 9<>"$LOCK_FILE"
+    flock -n 9 ||
+        die 20 "Outra criacao de usuario esta em andamento"
+
+    validate_environment
+    read_username
+    confirm_plan
+    create_linux_identity
+    create_samba_identity
+    create_personal_directory
+    validate_identity
+
+    COMMITTED=1
+    trap - ERR INT TERM HUP
+
+    publish_nextcloud_state || export_rc=$?
+
+    if [[ "$export_rc" -ne 0 ]]; then
+        print_partial_summary
+        log "WARN" \
+            "Conta mantida; corrija a exportacao antes de continuar no Nextcloud"
+        return "$export_rc"
+    fi
+    print_summary
+}
+
+main "$@"

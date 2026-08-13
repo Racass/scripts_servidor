@@ -91,3 +91,35 @@ O snapshot atual fica em:
 
 Snapshots horarios ficam em `archive/` por sete dias e sao legiveis somente
 por root.
+
+## Criacao de usuarios
+
+Instale:
+
+```bash
+install -o root -g root -m 0755 \
+  samba/criar_usuario_samba \
+  /usr/local/sbin/criar-usuario-samba
+```
+
+Execute interativamente:
+
+```bash
+criar-usuario-samba
+```
+
+O script:
+
+- rejeita `admin`, `nextcloud_user`, contas ou diretorios preexistentes;
+- serializa execucoes com `flock`;
+- cria a identidade Linux com senha bloqueada e shell `nologin`;
+- cria e habilita a conta tdbsam sem registrar a senha;
+- aplica e valida a ACL pessoal `2770`;
+- nao altera `smb.conf` ou `fileserver.conf`;
+- nao reinicia o Samba;
+- reverte somente recursos criados pela execucao se falhar antes do commit;
+- publica e valida o snapshot consumido pelo Nextcloud.
+
+Se a publicacao falhar depois da conta ser validada, a conta e mantida e o
+script termina com erro. Corrija o exportador antes de executar o apply no
+Nextcloud.

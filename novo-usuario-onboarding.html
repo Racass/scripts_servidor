@@ -163,56 +163,31 @@
 
     <section id="samba">
       <h2><span class="step">2</span>Criar no fileserver</h2>
-      <div class="notice warn">
-        O criador de usuários original não está versionado neste repositório.
-        O bloco abaixo é o procedimento manual compatível com o estado atual.
-        Se o script oficial for recuperado, prefira-o e mantenha suas rotinas
-        de backup, rollback, ACL e <code>testparm</code>.
+      <div class="notice info">
+        Use somente o script versionado <code>samba/criar_usuario_samba</code>.
+        Ele não altera <code>fileserver.conf</code>, não reinicia o Samba e
+        não cria login Linux interativo.
       </div>
 
-      <p>Entre em <code>fileserver.corp</code> como root e defina o username:</p>
-      <pre><code>NOVO_USUARIO="nome_em_minusculas"
+      <p>Entre em <code>fileserver.corp</code> como root, atualize e instale:</p>
+      <pre><code>REPO=/home/rafael/git/scripts_servidor
+git -C "$REPO" pull --ff-only
+install -o root -g root -m 0755 \
+  "$REPO/samba/criar_usuario_samba" \
+  /usr/local/sbin/criar-usuario-samba
 
-[[ "$NOVO_USUARIO" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || exit 1
-[[ "$NOVO_USUARIO" != "admin" ]] || exit 1
-[[ "$NOVO_USUARIO" != "nextcloud_user" ]] || exit 1
-! getent passwd "$NOVO_USUARIO" &gt;/dev/null || exit 1
-! pdbedit -L | cut -d: -f1 | grep -Fxq "$NOVO_USUARIO" || exit 1</code></pre>
-
-      <p>Crie a identidade Linux bloqueada para senha local:</p>
-      <pre><code>adduser --disabled-password --gecos "" "$NOVO_USUARIO"
-usermod -aG samba-users "$NOVO_USUARIO"</code></pre>
-
-      <p>Adicione somente os grupos aprovados:</p>
-      <pre><code># Execute apenas as linhas aprovadas:
-usermod -aG samba-admin "$NOVO_USUARIO"
-usermod -aG samba-laudos "$NOVO_USUARIO"
-usermod -aG samba-laudos-mega "$NOVO_USUARIO"
-usermod -aG samba-administrativo "$NOVO_USUARIO"</code></pre>
-
-      <p>Crie a senha Samba interativamente:</p>
-      <pre><code>smbpasswd -a "$NOVO_USUARIO"</code></pre>
+criar-usuario-samba</code></pre>
 
       <div class="notice info">
-        A senha digitada aqui é a senha Samba. Ela não será enviada ao
-        Nextcloud e não deve aparecer em ticket, terminal compartilhado ou
-        arquivo.
+        Responda aos grupos conforme a aprovação. A senha solicitada é apenas
+        a senha Samba/Windows; ela não será enviada ao Nextcloud.
       </div>
 
-      <p>Crie a pasta pessoal e replique o padrão de ACL validado:</p>
-      <pre><code>PASTA="/srv/files/usuarios/$NOVO_USUARIO"
+      <p>Ao terminar, confirme novamente com o username criado:</p>
+      <pre><code>NOVO_USUARIO="nome_criado"
+PASTA="/srv/files/usuarios/$NOVO_USUARIO"
 
-install -d -o "$NOVO_USUARIO" -g samba-users -m 2770 "$PASTA"
-setfacl -b "$PASTA"
-setfacl -m \
-  "u::rwx,u:${NOVO_USUARIO}:rwx,g::---,g:samba-users:---,g:samba-admin:rwx,m::rwx,o::---" \
-  "$PASTA"
-setfacl -d -m \
-  "u::rwx,g::---,g:samba-admin:rwx,m::rwx,o::---" \
-  "$PASTA"</code></pre>
-
-      <p>Valide antes de exportar:</p>
-      <pre><code>id "$NOVO_USUARIO"
+id "$NOVO_USUARIO"
 pdbedit -Lv "$NOVO_USUARIO" |
   sed -n '/^Unix username:/p;/^Account Flags:/p'
 stat -c '%a %U:%G %n' "$PASTA"
@@ -243,12 +218,14 @@ default:other::---</code></pre>
       <label class="check"><input type="checkbox"> Somente grupos aprovados foram adicionados.</label>
       <label class="check"><input type="checkbox"> Pasta pessoal está <code>2770 usuário:samba-users</code>.</label>
       <label class="check"><input type="checkbox"> ACL permite usuário e <code>samba-admin</code>, mas não outros usuários.</label>
+      <label class="check"><input type="checkbox"> Script confirmou a publicação do snapshot.</label>
     </section>
 
     <section id="sync">
       <h2><span class="step">3</span>Exportar e criar a réplica Nextcloud</h2>
       <p>No fileserver:</p>
-      <pre><code>systemctl start export-nextcloud-state.service
+      <pre><code>NOVO_USUARIO="nome_criado"
+
 systemctl show export-nextcloud-state.service \
   -p Result -p ExecMainStatus
 
