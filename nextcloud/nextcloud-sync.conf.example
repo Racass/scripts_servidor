@@ -1,0 +1,10 @@
+# Instale como /etc/samba-nextcloud-sync.conf, root:root, modo 0640.
+
+CONTAINER="nextcloud-app"
+SOURCE_ALIAS="samba-state-source"
+SOURCE_PATH="/state.json"
+
+MAX_AGE_SECONDS=21600
+MAX_FUTURE_SECONDS=300
+EXPECTED_NEXTCLOUD_MAJOR=34
+

@@ -101,3 +101,42 @@ O consumidor deve usar:
 ```bash
 sftp -F /etc/samba-nextcloud-sync/ssh_config samba-state-source
 ```
+
+## Sincronizacao em dry-run
+
+`sync-nextcloud-state` inicialmente aceita somente `--dry-run`. Ele:
+
+- baixa o snapshot por SFTP para staging root-only;
+- valida tamanho, schema, freshness, geração e circuit breakers;
+- lista usuários e grupos do OCC com limite alto e falha fechada se houver
+  possível truncamento;
+- lê o marker `samba_nextcloud_sync/managed_by`;
+- calcula contas novas, conflitos e memberships;
+- grava `last-plan.json` e, somente em execução saudável sem conflitos,
+  promove `last-known-good.json`;
+- nunca cria, altera, habilita, desabilita ou apaga contas.
+
+Instale:
+
+```bash
+install -o root -g root -m 0755 \
+  nextcloud/sync-nextcloud-state \
+  /usr/local/sbin/sync-nextcloud-state
+
+install -D -o root -g root -m 0644 \
+  nextcloud/lib/build-sync-plan.jq \
+  /usr/local/lib/samba-nextcloud/build-sync-plan.jq
+
+install -o root -g root -m 0640 \
+  nextcloud/nextcloud-sync.conf.example \
+  /etc/samba-nextcloud-sync.conf
+```
+
+Execute manualmente:
+
+```bash
+sudo sync-nextcloud-state --dry-run
+```
+
+Um username que já exista no Nextcloud sem o marker do sincronizador é
+tratado como conflito e nunca é adotado automaticamente.

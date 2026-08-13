@@ -1,0 +1,467 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+
+readonly EXIT_CONFIG=10
+readonly EXIT_DEPENDENCY=11
+readonly EXIT_PRIVILEGE=12
+readonly EXIT_LOCKED=20
+readonly EXIT_INVALID_STATE=40
+readonly EXIT_GENERATION=41
+readonly EXIT_CIRCUIT_BREAKER=42
+readonly EXIT_TRANSPORT=50
+readonly EXIT_SSH_IDENTITY=51
+readonly EXIT_NEXTCLOUD=60
+readonly EXIT_OCC_DISCOVERY=61
+readonly EXIT_CONFLICT=62
+readonly EXIT_FILESYSTEM=70
+
+readonly CONFIG_DIR="/etc/samba-nextcloud-sync"
+readonly STATE_DIR="/var/lib/samba-nextcloud-sync"
+readonly INCOMING_DIR="$STATE_DIR/incoming"
+readonly LOCAL_STATE_DIR="$STATE_DIR/state"
+readonly LOCK_DIR="/run/samba-nextcloud-sync"
+readonly LOCK_FILE="$LOCK_DIR/sync.lock"
+readonly SSH_CONFIG="$CONFIG_DIR/ssh_config"
+readonly VALIDATOR="/usr/local/lib/samba-nextcloud/validate-nextcloud-state.jq"
+readonly PLAN_BUILDER="/usr/local/lib/samba-nextcloud/build-sync-plan.jq"
+readonly LAST_GOOD="$LOCAL_STATE_DIR/last-known-good.json"
+readonly LAST_PLAN="$LOCAL_STATE_DIR/last-plan.json"
+readonly MAX_STATE_BYTES=1048576
+readonly DOWNLOAD_FILE_BLOCK_LIMIT=4096
+readonly OCC_DISCOVERY_LIMIT=20000
+
+CONFIG_FILE="/etc/samba-nextcloud-sync.conf"
+CONTAINER="nextcloud-app"
+SOURCE_ALIAS="samba-state-source"
+SOURCE_PATH="/state.json"
+MAX_AGE_SECONDS=21600
+MAX_FUTURE_SECONDS=300
+EXPECTED_NEXTCLOUD_MAJOR=34
+
+WORK_DIR=""
+CANDIDATE=""
+PLAN_TEMP=""
+
+log() {
+    local level="$1"
+    shift
+    printf '[%s] %s\n' "$level" "$*" >&2
+}
+
+die() {
+    local code="$1"
+    shift
+    log "ERROR" "$*"
+    exit "$code"
+}
+
+cleanup() {
+    if [[ -n "$CANDIDATE" && -e "$CANDIDATE" ]]; then
+        rm -f -- "$CANDIDATE"
+    fi
+    if [[ -n "$PLAN_TEMP" && -e "$PLAN_TEMP" ]]; then
+        rm -f -- "$PLAN_TEMP"
+    fi
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+        rm -rf -- "$WORK_DIR"
+    fi
+}
+trap cleanup EXIT
+
+usage() {
+    cat >&2 <<'EOF'
+Uso: sync-nextcloud-state --dry-run [--config /caminho/arquivo.conf]
+
+Esta versao nunca aplica mutacoes no Nextcloud.
+EOF
+}
+
+parse_arguments() {
+    local dry_run=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            --config)
+                [[ $# -ge 2 ]] || {
+                    usage
+                    exit "$EXIT_CONFIG"
+                }
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            *)
+                usage
+                exit "$EXIT_CONFIG"
+                ;;
+        esac
+    done
+
+    [[ "$dry_run" -eq 1 ]] || {
+        usage
+        exit "$EXIT_CONFIG"
+    }
+}
+
+validate_root_owned_file() {
+    local path="$1"
+    local owner mode
+
+    [[ -f "$path" && ! -L "$path" ]] ||
+        die "$EXIT_CONFIG" "Arquivo invalido: $path"
+    owner="$(stat -c '%u' -- "$path")"
+    mode="$(stat -c '%a' -- "$path")"
+    [[ "$owner" == "0" ]] ||
+        die "$EXIT_CONFIG" "O arquivo deve pertencer a root: $path"
+    (( (8#$mode & 8#022) == 0 )) ||
+        die "$EXIT_CONFIG" "O arquivo nao pode ser gravavel por grupo/outros: $path"
+}
+
+load_configuration() {
+    [[ "$CONFIG_FILE" == /* ]] ||
+        die "$EXIT_CONFIG" "O caminho da configuracao deve ser absoluto"
+    if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
+        validate_root_owned_file "$CONFIG_FILE"
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    [[ "$CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+        die "$EXIT_CONFIG" "CONTAINER invalido"
+    [[ "$SOURCE_ALIAS" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+        die "$EXIT_CONFIG" "SOURCE_ALIAS invalido"
+    [[ "$SOURCE_PATH" =~ ^/[A-Za-z0-9._/-]+$ &&
+        "$SOURCE_PATH" != *"/../"* ]] ||
+        die "$EXIT_CONFIG" "SOURCE_PATH invalido"
+    [[ "$MAX_AGE_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+        die "$EXIT_CONFIG" "MAX_AGE_SECONDS invalido"
+    [[ "$MAX_FUTURE_SECONDS" =~ ^[0-9]+$ ]] ||
+        die "$EXIT_CONFIG" "MAX_FUTURE_SECONDS invalido"
+    [[ "$EXPECTED_NEXTCLOUD_MAJOR" =~ ^[1-9][0-9]*$ ]] ||
+        die "$EXIT_CONFIG" "EXPECTED_NEXTCLOUD_MAJOR invalido"
+}
+
+require_dependencies() {
+    local command
+    for command in \
+        cut date docker flock grep install jq mktemp mv rm sftp sha256sum \
+        sort stat sync
+    do
+        command -v "$command" >/dev/null 2>&1 ||
+            die "$EXIT_DEPENDENCY" "Dependencia ausente: $command"
+    done
+
+    validate_root_owned_file "$SSH_CONFIG"
+    validate_root_owned_file "$VALIDATOR"
+    validate_root_owned_file "$PLAN_BUILDER"
+}
+
+ensure_directory() {
+    local path="$1"
+    local mode="$2"
+
+    [[ ! -L "$path" ]] ||
+        die "$EXIT_FILESYSTEM" "Diretorio nao pode ser symlink: $path"
+    if [[ ! -e "$path" ]]; then
+        install -d -o root -g root -m "$mode" -- "$path" ||
+            die "$EXIT_FILESYSTEM" "Nao foi possivel criar $path"
+    fi
+    [[ "$(stat -c '%F:%u:%g:%a' -- "$path")" == \
+        "directory:0:0:$mode" ]] ||
+        die "$EXIT_FILESYSTEM" \
+            "Diretorio deve ser root:root modo $mode: $path"
+}
+
+prepare_runtime() {
+    ensure_directory "$CONFIG_DIR" 700
+    ensure_directory "$STATE_DIR" 700
+    ensure_directory "$INCOMING_DIR" 700
+    ensure_directory "$LOCAL_STATE_DIR" 700
+    ensure_directory "$LOCK_DIR" 700
+
+    [[ ! -e "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] ||
+        [[ "$(stat -c '%F:%u:%g' -- "$LOCK_FILE")" == \
+            "regular empty file:0:0" ]] ||
+        die "$EXIT_FILESYSTEM" "Lock file existente e inseguro"
+}
+
+download_candidate() {
+    local batch_file="$WORK_DIR/sftp.batch"
+    local transport_log="$WORK_DIR/sftp.log"
+
+    CANDIDATE="$(mktemp --tmpdir="$INCOMING_DIR" '.state.json.XXXXXX')" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel criar staging"
+    printf 'get %s %s\n' "$SOURCE_PATH" "$CANDIDATE" >"$batch_file"
+
+    # Limita o arquivo criado pelo subprocesso a poucos MiB. O contrato
+    # continua rejeitando qualquer snapshot maior que 1 MiB.
+    if ! (
+        ulimit -f "$DOWNLOAD_FILE_BLOCK_LIMIT"
+        sftp -q -b "$batch_file" -F "$SSH_CONFIG" \
+            "$SOURCE_ALIAS"
+    ) >"$transport_log" 2>&1
+    then
+        if grep -Eqi \
+            'host key verification failed|remote host identification has changed|permission denied|no matching host key' \
+            "$transport_log"
+        then
+            die "$EXIT_SSH_IDENTITY" \
+                "Falha de identidade ou autenticacao SSH"
+        fi
+        die "$EXIT_TRANSPORT" "Falha ao baixar o snapshot"
+    fi
+
+    [[ -f "$CANDIDATE" && ! -L "$CANDIDATE" ]] ||
+        die "$EXIT_INVALID_STATE" "Snapshot baixado nao e arquivo regular"
+    [[ "$(stat -c '%u:%g' -- "$CANDIDATE")" == "0:0" ]] ||
+        die "$EXIT_INVALID_STATE" "Owner inesperado no snapshot baixado"
+    [[ "$(stat -c '%s' -- "$CANDIDATE")" -le "$MAX_STATE_BYTES" ]] ||
+        die "$EXIT_INVALID_STATE" "Snapshot excede 1 MiB"
+}
+
+validate_candidate() {
+    local generated_at generated_epoch now_epoch age
+
+    jq -e -f "$VALIDATOR" "$CANDIDATE" >/dev/null ||
+        die "$EXIT_INVALID_STATE" "Snapshot viola o contrato estrutural"
+
+    generated_at="$(jq -r '.generated_at' "$CANDIDATE")"
+    generated_epoch="$(date -u -d "$generated_at" +%s)" ||
+        die "$EXIT_INVALID_STATE" "generated_at nao pode ser interpretado"
+    now_epoch="$(date -u +%s)"
+
+    if (( generated_epoch > now_epoch + MAX_FUTURE_SECONDS )); then
+        die "$EXIT_GENERATION" "Snapshot esta no futuro"
+    fi
+    age=$((now_epoch - generated_epoch))
+    if (( age > MAX_AGE_SECONDS )); then
+        die "$EXIT_GENERATION" "Snapshot stale: ${age}s"
+    fi
+}
+
+check_generation_and_circuit_breakers() {
+    local candidate_id candidate_hash candidate_epoch
+    local previous_id previous_hash previous_epoch
+    local previous_count candidate_count removed
+
+    CIRCUIT_BREAKER=0
+    SAME_GENERATION=0
+
+    candidate_id="$(jq -r '.generation_id' "$CANDIDATE")"
+    candidate_hash="$(sha256sum "$CANDIDATE" | cut -d' ' -f1)"
+    candidate_epoch="$(date -u -d \
+        "$(jq -r '.generated_at' "$CANDIDATE")" +%s)"
+    candidate_count="$(jq -r '.counts.users' "$CANDIDATE")"
+
+    if [[ ! -e "$LAST_GOOD" ]]; then
+        if [[ "$candidate_count" -eq 0 ]]; then
+            die "$EXIT_CIRCUIT_BREAKER" \
+                "Baseline inicial vazio exige aceitacao administrativa"
+        fi
+        return
+    fi
+
+    validate_root_owned_file "$LAST_GOOD"
+    jq -e -f "$VALIDATOR" "$LAST_GOOD" >/dev/null ||
+        die "$EXIT_FILESYSTEM" "Last-known-good local invalido"
+
+    previous_id="$(jq -r '.generation_id' "$LAST_GOOD")"
+    previous_hash="$(sha256sum "$LAST_GOOD" | cut -d' ' -f1)"
+    previous_epoch="$(date -u -d \
+        "$(jq -r '.generated_at' "$LAST_GOOD")" +%s)"
+
+    if [[ "$candidate_id" == "$previous_id" ]]; then
+        [[ "$candidate_hash" == "$previous_hash" ]] ||
+            die "$EXIT_GENERATION" \
+                "Mesmo generation_id com conteudo diferente"
+        SAME_GENERATION=1
+        return
+    fi
+
+    (( candidate_epoch > previous_epoch )) ||
+        die "$EXIT_GENERATION" "Snapshot regressivo ou fora de ordem"
+
+    previous_count="$(jq -r '.counts.users' "$LAST_GOOD")"
+    if (( candidate_count >= previous_count )); then
+        return
+    fi
+
+    removed=$((previous_count - candidate_count))
+    if (( candidate_count == 0 ||
+          removed >= 3 ||
+          removed * 100 >= previous_count * 25 )); then
+        CIRCUIT_BREAKER=1
+        log "ERROR" \
+            "Circuit breaker: populacao caiu de $previous_count para $candidate_count"
+    fi
+}
+
+occ() {
+    docker exec -u www-data "$CONTAINER" php occ --no-ansi \
+        --no-interaction "$@"
+}
+
+occ_list_bounded() {
+    local command="$1"
+    local destination="$2"
+    local count
+
+    occ "$command" \
+        --limit="$OCC_DISCOVERY_LIMIT" \
+        --offset=0 \
+        --output=json >"$destination" ||
+        die "$EXIT_OCC_DISCOVERY" "Falha no comando OCC $command"
+    jq -e 'type == "object"' "$destination" >/dev/null ||
+        die "$EXIT_OCC_DISCOVERY" "Saida OCC invalida para $command"
+
+    count="$(jq 'length' "$destination")"
+    (( count < OCC_DISCOVERY_LIMIT )) ||
+        die "$EXIT_OCC_DISCOVERY" \
+            "$command atingiu o limite seguro de descoberta"
+}
+
+discover_nextcloud() {
+    local status_file="$WORK_DIR/status.json"
+    local users_file="$WORK_DIR/users.json"
+    local groups_file="$WORK_DIR/groups.json"
+    local markers_file="$WORK_DIR/markers.json"
+    local marker_entries="$WORK_DIR/marker-entries.jsonl"
+    local installed maintenance upgrade version major user marker
+
+    docker inspect "$CONTAINER" >/dev/null 2>&1 ||
+        die "$EXIT_NEXTCLOUD" "Container Nextcloud indisponivel"
+
+    occ status --output=json >"$status_file" ||
+        die "$EXIT_NEXTCLOUD" "Nao foi possivel consultar o status Nextcloud"
+    jq -e 'type == "object"' "$status_file" >/dev/null ||
+        die "$EXIT_OCC_DISCOVERY" "Status OCC nao e JSON valido"
+
+    installed="$(jq -r '.installed' "$status_file")"
+    maintenance="$(jq -r '.maintenance' "$status_file")"
+    upgrade="$(jq -r '.needsDbUpgrade' "$status_file")"
+    version="$(jq -r '.version' "$status_file")"
+    major="${version%%.*}"
+    [[ "$installed" == "true" && "$maintenance" == "false" &&
+        "$upgrade" == "false" && "$major" == "$EXPECTED_NEXTCLOUD_MAJOR" ]] ||
+        die "$EXIT_NEXTCLOUD" \
+            "Nextcloud nao esta pronto ou possui versao inesperada: $version"
+
+    occ_list_bounded "user:list" "$users_file"
+    occ_list_bounded "group:list" "$groups_file"
+
+    : >"$marker_entries"
+    while IFS= read -r user; do
+        marker="$(occ user:setting "$user" samba_nextcloud_sync managed_by \
+            --default-value='' 2>/dev/null)" ||
+            die "$EXIT_OCC_DISCOVERY" \
+                "Falha ao consultar marker do usuario $user"
+        jq -nc --arg key "$user" --arg value "$marker" \
+            '{key: $key, value: $value}' >>"$marker_entries"
+    done < <(jq -r 'keys[]' "$users_file")
+    jq -s 'from_entries' "$marker_entries" >"$markers_file"
+
+    NC_USERS_FILE="$users_file"
+    NC_GROUPS_FILE="$groups_file"
+    MARKERS_FILE="$markers_file"
+}
+
+build_plan() {
+    local input="$WORK_DIR/planner-input.json"
+
+    jq -n \
+        --slurpfile source "$CANDIDATE" \
+        --slurpfile users "$NC_USERS_FILE" \
+        --slurpfile groups "$NC_GROUPS_FILE" \
+        --slurpfile markers "$MARKERS_FILE" \
+        '{
+          source: $source[0],
+          nextcloud_users: $users[0],
+          nextcloud_groups: $groups[0],
+          markers: $markers[0]
+        }' >"$input"
+
+    jq -f "$PLAN_BUILDER" "$input" >"$WORK_DIR/plan.json" ||
+        die "$EXIT_OCC_DISCOVERY" "Nao foi possivel calcular o plano"
+    jq -e '
+      type == "object"
+      and .mode == "dry-run"
+      and (.counts | type == "object")
+    ' "$WORK_DIR/plan.json" >/dev/null ||
+        die "$EXIT_OCC_DISCOVERY" "Plano calculado invalido"
+}
+
+publish_local_state() {
+    local destination="$1"
+    local source="$2"
+    local mode="$3"
+    local temp
+
+    temp="$(mktemp --tmpdir="$LOCAL_STATE_DIR" ".${destination}.XXXXXX")" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel criar arquivo local temporario"
+    install -o root -g root -m "$mode" "$source" "$temp" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel preparar $destination"
+    mv -fT -- "$temp" "$LOCAL_STATE_DIR/$destination" ||
+        die "$EXIT_FILESYSTEM" "Publicacao atomica falhou: $destination"
+    sync -f "$LOCAL_STATE_DIR" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel sincronizar estado local"
+}
+
+report_plan() {
+    local counts generation
+
+    generation="$(jq -r '.generation_id' "$WORK_DIR/plan.json")"
+    counts="$(jq -c '.counts' "$WORK_DIR/plan.json")"
+    log "INFO" "Plano dry-run generation_id=$generation counts=$counts"
+    jq . "$WORK_DIR/plan.json"
+}
+
+main() {
+    local conflicts
+
+    parse_arguments "$@"
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] ||
+        die "$EXIT_PRIVILEGE" "Execute como root"
+
+    load_configuration
+    require_dependencies
+    prepare_runtime
+
+    exec 9>"$LOCK_FILE"
+    flock -n 9 ||
+        die "$EXIT_LOCKED" "Outra sincronizacao esta em execucao"
+
+    WORK_DIR="$(mktemp -d -t samba-nextcloud-sync.XXXXXX)" ||
+        die "$EXIT_FILESYSTEM" "Nao foi possivel criar workspace"
+
+    download_candidate
+    validate_candidate
+    check_generation_and_circuit_breakers
+
+    if [[ "$CIRCUIT_BREAKER" -eq 1 ]]; then
+        exit "$EXIT_CIRCUIT_BREAKER"
+    fi
+
+    discover_nextcloud
+    build_plan
+    publish_local_state "last-plan.json" "$WORK_DIR/plan.json" 0600
+
+    report_plan
+
+    conflicts="$(jq -r '.counts.conflicts' "$WORK_DIR/plan.json")"
+    if [[ "$conflicts" -gt 0 ]]; then
+        die "$EXIT_CONFLICT" \
+            "$conflicts conta(s) Nextcloud preexistente(s) sem marker"
+    fi
+
+    if [[ "$SAME_GENERATION" -eq 0 ]]; then
+        publish_local_state "last-known-good.json" "$CANDIDATE" 0600
+    fi
+}
+
+main "$@"

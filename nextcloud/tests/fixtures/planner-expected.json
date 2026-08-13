@@ -1,0 +1,55 @@
+{
+  "mode": "dry-run",
+  "generation_id": "d6e66eb5-5f47-43e8-a9d4-41f5a1b5a2ac",
+  "generated_at": "2026-08-12T22:00:00Z",
+  "missing_groups": [
+    "samba-administrativo"
+  ],
+  "new_users": [
+    "maria"
+  ],
+  "conflicting_users": [
+    "joao"
+  ],
+  "managed_users": [
+    "ana",
+    "orphan"
+  ],
+  "absent_managed_users": [
+    "orphan"
+  ],
+  "memberships_add": [
+    {
+      "user": "maria",
+      "group": "samba-users",
+      "after_create": true
+    },
+    {
+      "user": "ana",
+      "group": "samba-laudos",
+      "after_create": false
+    },
+    {
+      "user": "maria",
+      "group": "samba-administrativo",
+      "after_create": true
+    }
+  ],
+  "memberships_remove": [
+    {
+      "user": "ana",
+      "group": "samba-admin"
+    }
+  ],
+  "counts": {
+    "source_users": 3,
+    "nextcloud_users": 4,
+    "managed_users": 2,
+    "missing_groups": 1,
+    "new_users": 1,
+    "conflicts": 1,
+    "absent_managed_users": 1,
+    "memberships_add": 3,
+    "memberships_remove": 1
+  }
+}
