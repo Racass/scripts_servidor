@@ -17,6 +17,22 @@ Nextcloud. Não misture as configurações dos dois conectores.
 Crie `nextcloud/docker/.env` a partir de `.env.example`, com permissão `0600`.
 O Compose recusa iniciar se as variáveis obrigatórias não estiverem definidas.
 
+As imagens são fixadas por versão e digest. Atualizações exigem mudança
+explícita no repositório, backup e validação antes de recriar os containers.
+
+Somente na primeira instalação, use o override de bootstrap:
+
+```bash
+cd nextcloud/docker
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.bootstrap.yml \
+  up -d
+```
+
+Depois da instalação, use apenas `docker-compose.yml`. A senha administrativa
+não fica no ambiente normal do container e pode ser removida do `.env`.
+
 O Nextcloud publica HTTP somente em `127.0.0.1:8080`. A porta não deve ser
 exposta diretamente à LAN ou ao WARP.
 
@@ -220,3 +236,9 @@ antes de remoções de memberships ou desativações.
 ```bash
 sudo bash nextcloud/install-systemd-schedulers
 ```
+
+## Operacao
+
+Os procedimentos de onboarding, lifecycle, adoção, rename, purge, backup,
+restore e atualização dos containers estão em
+[`OPERATIONS.md`](OPERATIONS.md).
