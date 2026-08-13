@@ -16,9 +16,10 @@ As ferramentas `getent`, `pdbedit`, `testparm`, `flock` e coreutils tambem
 devem estar disponiveis.
 
 Embora a operacao seja somente leitura, `pdbedit -L` abre `passdb.tdb` em
-modo read-write para locking. Por isso a unidade systemd libera somente
-`/var/lib/samba/private/passdb.tdb` dentro do sandbox `ProtectSystem=strict`.
-O exportador nao executa nenhum subcomando de alteracao.
+modo read-write para locking e consulta `secrets.tdb` e
+`account_policy.tdb`. Por isso a unidade systemd libera somente esses tres
+arquivos dentro do sandbox `ProtectSystem=strict`. O exportador nao executa
+nenhum subcomando de alteracao.
 
 ## Instalacao
 

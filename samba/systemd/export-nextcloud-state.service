@@ -24,4 +24,6 @@ LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 ReadWritePaths=/var/lib/samba/private/passdb.tdb
+ReadWritePaths=/var/lib/samba/private/secrets.tdb
+ReadWritePaths=/var/lib/samba/account_policy.tdb
 TimeoutStartSec=5min
