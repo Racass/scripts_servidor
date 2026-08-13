@@ -86,6 +86,13 @@ originRequest:
 ```
 
 Não é necessário migrar esse túnel para gerenciamento pelo dashboard.
+Mantenha `/etc/cloudflared/config.yml`, o arquivo de credencial do túnel e
+qualquer cópia em `/root/.cloudflared/` como `root:root`, modo `0600` ou mais
+restritivo. Valide o ingress antes de reiniciar:
+
+```bash
+cloudflared --config /etc/cloudflared/config.yml tunnel ingress validate
+```
 
 ## Transporte do estado Samba
 
