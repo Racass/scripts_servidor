@@ -138,7 +138,6 @@ Match User nextcloud-sync
     ForceCommand internal-sftp -R -d /
     DisableForwarding yes
     PermitTTY no
-    PermitUserEnvironment no
     X11Forwarding no
 EOF
 
