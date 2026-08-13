@@ -22,7 +22,10 @@ readonly -a MANAGED_GROUPS=(
     "samba-laudos-mega"
     "samba-administrativo"
 )
-readonly EXCLUDED_USER="nextcloud_user"
+readonly -a EXCLUDED_USERS=(
+    "nextcloud_user"
+    "admin"
+)
 readonly STATE_DIR="/var/lib/samba-nextcloud-export"
 readonly VALIDATOR_PATH="/usr/local/lib/samba-nextcloud/validate-nextcloud-state.jq"
 readonly LOCK_DIR="/run/samba-nextcloud-export"
@@ -127,7 +130,7 @@ require_dependencies() {
     local command
     for command in \
         cat cmp cut date find flock getent grep id install jq mkdir mktemp mv \
-        pdbedit rm sleep sort stat sync testparm tr
+        paste pdbedit rm sleep sort stat sync testparm tr
     do
         command -v "$command" >/dev/null 2>&1 ||
             die "$EXIT_DEPENDENCY" "Dependencia ausente: $command"
@@ -187,6 +190,16 @@ valid_username() {
     [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
 }
 
+excluded_username() {
+    local candidate="$1"
+    local excluded
+
+    for excluded in "${EXCLUDED_USERS[@]}"; do
+        [[ "$candidate" == "$excluded" ]] && return 0
+    done
+    return 1
+}
+
 capture_group_state() {
     local destination="$1"
     local group record found_group ignored gid members extra username
@@ -215,7 +228,7 @@ capture_group_state() {
         if [[ -n "$members" ]]; then
             IFS=',' read -r -a member_list <<<"$members"
             for username in "${member_list[@]}"; do
-                if [[ "$username" == "$EXCLUDED_USER" ]]; then
+                if excluded_username "$username"; then
                     printf '%s\n' "$username" >>"$destination/excluded-users"
                     continue
                 fi
@@ -238,7 +251,7 @@ capture_group_state() {
             <<<"$passwd_record"
         group="${gid_to_group[$primary_gid]:-}"
         [[ -n "$group" ]] || continue
-        if [[ "$username" == "$EXCLUDED_USER" ]]; then
+        if excluded_username "$username"; then
             printf '%s\n' "$username" >>"$destination/excluded-users"
             continue
         fi
@@ -448,8 +461,8 @@ main() {
     read_stable_state
 
     if [[ -s "$STABLE_STATE_DIR/excluded-users" ]]; then
-        log "WARN" \
-            "A conta tecnica $EXCLUDED_USER foi excluida do snapshot"
+        log "WARN" "Contas protegidas excluidas do snapshot: $(paste -sd, \
+            "$STABLE_STATE_DIR/excluded-users")"
     fi
 
     validate_identities

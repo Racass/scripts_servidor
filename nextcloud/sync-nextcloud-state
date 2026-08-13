@@ -32,6 +32,10 @@ readonly LAST_PLAN="$LOCAL_STATE_DIR/last-plan.json"
 readonly MAX_STATE_BYTES=1048576
 readonly DOWNLOAD_FILE_BLOCK_LIMIT=4096
 readonly OCC_DISCOVERY_LIMIT=20000
+readonly -a PROTECTED_USERS=(
+    "admin"
+    "nextcloud_user"
+)
 
 CONFIG_FILE="/etc/samba-nextcloud-sync.conf"
 CONTAINER="nextcloud-app"
@@ -226,10 +230,19 @@ download_candidate() {
 }
 
 validate_candidate() {
-    local generated_at generated_epoch now_epoch age
+    local generated_at generated_epoch now_epoch age protected
 
     jq -e -f "$VALIDATOR" "$CANDIDATE" >/dev/null ||
         die "$EXIT_INVALID_STATE" "Snapshot viola o contrato estrutural"
+
+    for protected in "${PROTECTED_USERS[@]}"; do
+        if jq -e --arg user "$protected" \
+            '.users | index($user) != null' "$CANDIDATE" >/dev/null
+        then
+            die "$EXIT_INVALID_STATE" \
+                "Snapshot contem conta protegida: $protected"
+        fi
+    done
 
     generated_at="$(jq -r '.generated_at' "$CANDIDATE")"
     generated_epoch="$(date -u -d "$generated_at" +%s)" ||

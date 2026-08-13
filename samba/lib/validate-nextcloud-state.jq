@@ -7,7 +7,8 @@ def require($condition; $message):
 def valid_username:
   type == "string"
   and test("^[a-z_][a-z0-9_-]{0,31}$")
-  and . != "nextcloud_user";
+  and . != "nextcloud_user"
+  and . != "admin";
 
 def sorted_unique:
   . == (sort | unique);

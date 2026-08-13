@@ -21,7 +21,7 @@ case "$1:$2" in
         echo 'samba-users:x:1001:ana,nextcloud_user'
         ;;
     group:samba-admin)
-        echo 'samba-admin:x:1002:'
+        echo 'samba-admin:x:1002:admin'
         ;;
     group:samba-laudos)
         echo 'samba-laudos:x:1003:ana'
@@ -53,6 +53,7 @@ cat <<'OUT'
 ana:2001:
 joao:2002:
 nextcloud_user:2003:
+admin:2004:
 OUT
 EOF
 
@@ -68,9 +69,10 @@ grep -Fxq 'ana' "$TEST_DIR/result/groups/samba-users"
 grep -Fxq 'ana' "$TEST_DIR/result/groups/samba-laudos"
 grep -Fxq 'joao' "$TEST_DIR/result/groups/samba-admin"
 grep -Fxq 'nextcloud_user' "$TEST_DIR/result/excluded-users"
+grep -Fxq 'admin' "$TEST_DIR/result/excluded-users"
 
-if grep -R -Fxq 'nextcloud_user' "$TEST_DIR/result/groups"; then
-    echo "ERRO: nextcloud_user apareceu nos grupos exportados" >&2
+if grep -R -E -x -q 'nextcloud_user|admin' "$TEST_DIR/result/groups"; then
+    echo "ERRO: conta protegida apareceu nos grupos exportados" >&2
     exit 1
 fi
 

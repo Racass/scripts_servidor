@@ -60,7 +60,9 @@ Exemplo:
 3. `users` é exatamente a união ordenada e sem duplicatas dos membros.
 4. Todo username é válido e existe em NSS e no `tdbsam` no momento da
    exportação.
-5. `nextcloud_user` não aparece em `users` nem em qualquer grupo.
+5. `nextcloud_user` e `admin` não aparecem em `users` nem em qualquer grupo.
+   A primeira é a identidade técnica CIFS; a segunda é a conta administrativa
+   protegida da aplicação Nextcloud.
 6. `counts.users` corresponde ao tamanho de `users`; `counts.groups` é `5`.
 7. Propriedades desconhecidas são rejeitadas.
 8. O exportador somente publica após obter duas leituras consecutivas e

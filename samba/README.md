@@ -4,6 +4,10 @@ O exportador le os cinco grupos gerenciados sem alterar usuarios, ACLs,
 shares ou a configuracao Samba. O arquivo final e publicado atomicamente para
 consumo read-only pelo host Nextcloud.
 
+As contas `nextcloud_user` e `admin` sao protegidas e nunca aparecem no
+snapshot. Para acesso humano via web, crie uma identidade Samba diferente de
+`admin`; o grupo `samba-admin` nao concede administracao da aplicacao.
+
 Consulte [STATE-CONTRACT.md](STATE-CONTRACT.md) antes de alterar o formato.
 
 ## Dependencias

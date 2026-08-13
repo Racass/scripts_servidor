@@ -107,7 +107,10 @@
       "maxLength": 32,
       "pattern": "^[a-z_][a-z0-9_-]*$",
       "not": {
-        "const": "nextcloud_user"
+        "enum": [
+          "nextcloud_user",
+          "admin"
+        ]
       }
     },
     "userList": {
@@ -120,4 +123,3 @@
     }
   }
 }
-

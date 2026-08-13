@@ -140,3 +140,6 @@ sudo sync-nextcloud-state --dry-run
 
 Um username que já exista no Nextcloud sem o marker do sincronizador é
 tratado como conflito e nunca é adotado automaticamente.
+
+As contas `admin` e `nextcloud_user` são protegidas. O consumidor rejeita
+qualquer snapshot que contenha uma delas.
