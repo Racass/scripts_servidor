@@ -696,7 +696,8 @@ finalize_pending_user() {
     occ user:setting --quiet \
         "$user" samba_nextcloud_sync onboarding_pending "1" >/dev/null ||
         die "$EXIT_PARTIAL" "Falha ao marcar onboarding de $user"
-    occ user:profile --quiet "$user" displayname "$user" >/dev/null ||
+    occ user:setting --quiet \
+        "$user" settings display_name "$user" >/dev/null ||
         die "$EXIT_PARTIAL" "Falha ao normalizar display name de $user"
 
     info="$(occ user:info "$user" --output=json)" ||
