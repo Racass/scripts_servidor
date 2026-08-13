@@ -16,7 +16,7 @@ def managed_users:
     + {protected_users: ($input.protected_users // [])}
     | managed_users
   ) as $managed_users
-| reduce $managed_users[] as $user (
+| (reduce $managed_users[] as $user (
     {};
     if ($source_users | index($user)) != null then
       .
@@ -40,7 +40,7 @@ def managed_users:
           last_absent_at: $input.now
         }
     end
-  ) as $users
+  )) as $users
 | {
     version: 1,
     updated_at: $input.now,
