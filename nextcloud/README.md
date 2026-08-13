@@ -64,6 +64,11 @@ Enquanto o fileserver Samba estiver desligado, mantenha
 `sync-nextcloud-state.timer` desabilitado e administre usuários e grupos
 diretamente no Nextcloud.
 
+Após remover os grupos legados `samba-*`, mantenha os seis External Storages
+restritos ao grupo vazio `nextcloud-storage-disabled`. Substitua essa
+associação pelos novos grupos de acesso antes de remover o grupo de
+quarentena; um storage sem usuários ou grupos aplicáveis fica global.
+
 ## HTTPS privado
 
 O certificado público é emitido por Let's Encrypt com DNS-01 e token
