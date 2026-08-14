@@ -63,6 +63,28 @@ Enquanto o fileserver Samba estiver desligado, mantenha
 `sync-nextcloud-state.timer` desabilitado e administre usuários e grupos
 diretamente no Nextcloud.
 
+## Team folders
+
+O app `groupfolders` mantém arquivos corporativos independentes do lifecycle
+de uma conta individual. A Team Folder atual é:
+
+```text
+ID: 1
+Nome: Arquivos LAUPERTEC
+Grupo: admin
+Permissões: read, write, create, delete e share
+Storage: /srv/nextcloud-storage/app-data/__groupfolders/1
+```
+
+A importação do servidor legado está dentro dessa Team Folder. Apagar ou
+desabilitar o usuário `felipe` não remove esses arquivos. Antes de alterar
+grupos ou permissões, valide com:
+
+```bash
+docker exec -u www-data nextcloud-app \
+  php occ groupfolders:list --output=json
+```
+
 ## HTTPS privado
 
 O certificado público é emitido por Let's Encrypt com DNS-01 e token
