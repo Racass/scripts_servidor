@@ -364,7 +364,50 @@ rsync -rcn \
 
     <section id="publicar">
       <h2><span class="step">5</span>Publicar no Files do usuário</h2>
-      <p>Normalize ownership e permissões ainda no staging:</p>
+      <p>Normalize os nomes para Unicode NFC ainda no staging. O Nextcloud
+        rejeita acentos decompostos, comuns em arquivos vindos de SMB/macOS:</p>
+      <pre><code>python3 - "$STAGING" &lt;&lt;'PY'
+import os
+import sys
+import unicodedata
+
+root = os.path.abspath(sys.argv[1])
+plan = []
+for base, directories, files in os.walk(root):
+    for name in directories + files:
+        normalized = unicodedata.normalize("NFC", name)
+        if normalized != name:
+            plan.append((
+                os.path.join(base, name),
+                os.path.join(base, normalized),
+            ))
+
+collisions = [
+    (source, destination)
+    for source, destination in plan
+    if os.path.lexists(destination)
+]
+if collisions:
+    raise SystemExit(
+        f"Colisões após normalização: {len(collisions)}"
+    )
+
+for source, destination in sorted(
+    plan,
+    key=lambda pair: pair[0].count(os.sep),
+    reverse=True,
+):
+    os.rename(source, destination)
+
+print(f"Nomes normalizados para NFC: {len(plan)}")
+PY</code></pre>
+      <div class="expected">
+        <strong>Resultado esperado:</strong> o comando informa quantos nomes
+        foram normalizados e não relata colisões. O conteúdo dos arquivos não
+        é modificado.
+      </div>
+
+      <p>Normalize ownership e permissões:</p>
       <pre><code>chown -R 33:33 "$STAGING"
 find "$STAGING" -type d -exec chmod 0750 {} +
 find "$STAGING" -type f -exec chmod 0640 {} +
